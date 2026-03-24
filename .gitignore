@@ -1,0 +1,9 @@
+data/
+output/
+__pycache__/
+*.pyc
+*.hdf5
+*.h5
+*.pb
+*.ckpt
+Vitis-AI-Tutorials/
