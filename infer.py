@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Inference / evaluation script for trained UNET on RUGD dataset.
+Inference / evaluation script for trained UNET on RELLIS-3D dataset (RGBD).
 
 Usage:
-    python infer.py --image data/RUGD/RUGD_frames-with-annotations/creek/creek_00001.png
+    python infer.py --image data/RELLIS-3D/rgb/sample.jpg --depth data/RELLIS-3D/depth/sample.png
     python infer.py --eval_test          # evaluate Mean IoU on the full test set
 """
 
@@ -23,21 +23,22 @@ import tensorflow as tf
 from tensorflow.keras.models import load_model
 
 from dataset import (
-    RUGDDataset, NUM_CLASSES, RUGD_CLASSES, RUGD_COLORMAP_RGB,
-    rgb_mask_to_class_index, class_index_to_rgb, NORM_FACTOR
+    RELLIS3DDataset, NUM_CLASSES, TOTAL_CLASSES, KINEMATIC_CLASSES, KINEMATIC_COLORMAP,
+    class_index_to_rgb, NORM_FACTOR
 )
 
-
 def parse_args():
-    ap = argparse.ArgumentParser(description="UNET RUGD inference")
-    ap.add_argument("--model", default="output/keras_model/ep50_trained_unet_v2_224x224.keras",
-                    help="Path to trained .hdf5 model")
+    ap = argparse.ArgumentParser(description="UNET RELLIS-3D inference (RGBD)")
+    ap.add_argument("--model", default="output/keras_model/ep50_trained_unet_v2_rgbd_224x224.keras",
+                    help="Path to trained .keras model")
     ap.add_argument("--image", default=None,
-                    help="Path to a single image for inference")
+                    help="Path to a single RGB image for inference")
+    ap.add_argument("--depth", default=None,
+                    help="Path to the corresponding Depth image")
     ap.add_argument("--eval_test", action="store_true",
                     help="Evaluate IoU on the full test set")
-    ap.add_argument("--data_root", default="data/RUGD",
-                    help="Path to RUGD dataset directory")
+    ap.add_argument("--data_root", default="data/RELLIS-3D",
+                    help="Path to RELLIS-3D dataset directory")
     ap.add_argument("--output_dir", default="output/predictions",
                     help="Directory for saving prediction outputs")
     ap.add_argument("--img_height", type=int, default=224)
@@ -45,20 +46,38 @@ def parse_args():
     return ap.parse_args()
 
 
-def predict_single_image(model, image_path, img_size=(224, 224)):
-    """Run inference on a single image and return prediction overlay."""
+def predict_single_pair(model, image_path, depth_path, img_size=(224, 224)):
+    """Run inference on an RGB + Depth pair and return prediction overlay."""
     # Load original image
     img_orig = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if img_orig is None:
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    # Pre-process
+    # Process RGB
     img_resized = cv2.resize(img_orig, (img_size[1], img_size[0]))
     img_norm = img_resized.astype(np.float32) / NORM_FACTOR - 1.0
-    img_batch = np.expand_dims(img_norm, axis=0)
+    
+    # Process Depth
+    if depth_path and os.path.exists(depth_path):
+        depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+        depth = cv2.resize(depth, (img_size[1], img_size[0]), interpolation=cv2.INTER_NEAREST)
+        depth = depth.astype(np.float32)
+        MAX_DEPTH_VAL = 65535.0
+        if depth.max() > 0:
+             depth_norm = depth / MAX_DEPTH_VAL * 2.0 - 1.0
+        else:
+             depth_norm = depth * 0.0 - 1.0
+        depth_norm = np.expand_dims(depth_norm, axis=-1)
+    else:
+        print("WARNING: Depth image missing or invalid, using zero depth.")
+        depth_norm = np.full((img_size[0], img_size[1], 1), -1.0, dtype=np.float32)
+
+    fused_input = np.concatenate([img_norm, depth_norm], axis=-1)
+    img_batch = np.expand_dims(fused_input, axis=0)
 
     # Predict
     pred = model.predict(img_batch, verbose=0)
+    # Output shape is (1, H, W, 7). Model outputs logits/ReLU, apply argmax
     pred_class = np.argmax(pred[0], axis=-1)  # (H, W)
 
     # Convert class map to RGB
@@ -74,6 +93,7 @@ def predict_single_image(model, image_path, img_size=(224, 224)):
 def compute_iou(y_true_idx, y_pred_idx, n_classes, class_names):
     """Compute per-class IoU and mean IoU."""
     ious = []
+    # Evaluate across the active K=6 classes
     for c in range(n_classes):
         tp = np.sum((y_true_idx == c) & (y_pred_idx == c))
         fp = np.sum((y_true_idx != c) & (y_pred_idx == c))
@@ -97,15 +117,16 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f"Loading model: {args.model}")
-    model = load_model(args.model)
+    # Compile=False is standard for inference to avoid needing custom loss in scope
+    model = load_model(args.model, compile=False)
     print("Model loaded successfully.")
 
     img_size = (args.img_height, args.img_width)
 
     if args.image:
-        print(f"\nRunning inference on: {args.image}")
-        img_resized, pred_class, pred_rgb, overlay = predict_single_image(
-            model, args.image, img_size
+        print(f"\nRunning inference on: {args.image} and {args.depth}")
+        img_resized, pred_class, pred_rgb, overlay = predict_single_pair(
+            model, args.image, args.depth, img_size
         )
 
         # Save outputs
@@ -114,41 +135,33 @@ def main():
         # Create figure with 3 panels
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
         axes[0].imshow(cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB))
-        axes[0].set_title("Input Image")
+        axes[0].set_title("Input RGB Image")
         axes[0].axis('off')
 
         # --- Add labels to the middle image (pred_rgb) ---
         labeled_pred_rgb = pred_rgb.copy()
         for class_idx in np.unique(pred_class):
-            if class_idx == 0:  # Skip 'void' / background
+            if class_idx == 6:  # Skip 'Void'
                 continue
                 
-            # Create a binary mask for this class
             class_mask = (pred_class == class_idx).astype(np.uint8)
-            
-            # Find contours
             contours, _ = cv2.findContours(class_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            # Only label the largest contiguous region for each class to avoid clutter
             if contours:
                 largest_contour = max(contours, key=cv2.contourArea)
-                if cv2.contourArea(largest_contour) > 100:  # Only label reasonably sized regions
+                if cv2.contourArea(largest_contour) > 100:
                     M = cv2.moments(largest_contour)
                     if M["m00"] != 0:
                         cX = int(M["m10"] / M["m00"])
                         cY = int(M["m01"] / M["m00"])
                         
-                        class_name = RUGD_CLASSES[class_idx]
-                        
-                        # Draw text with a thin black outline for visibility
+                        class_name = KINEMATIC_CLASSES[class_idx]
                         font = cv2.FONT_HERSHEY_SIMPLEX
                         font_scale = 0.5
                         thickness = 1
                         
-                        # Black outline
                         cv2.putText(labeled_pred_rgb, class_name, (cX - 15, cY), font, 
                                     font_scale, (0, 0, 0), thickness + 1, cv2.LINE_AA)
-                        # White text
                         cv2.putText(labeled_pred_rgb, class_name, (cX - 15, cY), font, 
                                     font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
@@ -167,7 +180,7 @@ def main():
 
     if args.eval_test:
         print("\nEvaluating on test set...")
-        test_gen = RUGDDataset(args.data_root, split="test",
+        test_gen = RELLIS3DDataset(args.data_root, split="test",
                               batch_size=args.batch_size if hasattr(args, 'batch_size') else 8,
                               img_size=img_size)
         X_test, Y_test = test_gen.get_all_data()
@@ -177,12 +190,12 @@ def main():
         y_true_idx = np.argmax(Y_test, axis=3)
 
         print("\nTest set IoU:")
-        compute_iou(y_true_idx, y_pred_idx, NUM_CLASSES, RUGD_CLASSES)
+        compute_iou(y_true_idx, y_pred_idx, NUM_CLASSES, KINEMATIC_CLASSES)
 
     if not args.image and not args.eval_test:
-        print("No action specified. Use --image or --eval_test.")
+        print("No action specified. Use --image (and --depth) or --eval_test.")
         print("Example:")
-        print("  python infer.py --image data/RUGD/RUGD_frames-with-annotations/creek/creek_00001.png")
+        print("  python infer.py --image data/RELLIS-3D/rgb/sample.jpg --depth data/RELLIS-3D/depth/sample.png")
         print("  python infer.py --eval_test")
 
 

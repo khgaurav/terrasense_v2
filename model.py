@@ -76,7 +76,7 @@ def build_unet(n_classes, input_height=224, input_width=224,
     assert input_height % 16 == 0, f"input_height must be divisible by 16, got {input_height}"
     assert input_width % 16 == 0, f"input_width must be divisible by 16, got {input_width}"
 
-    img_input = Input(shape=(input_height, input_width, 3))
+    img_input = Input(shape=(input_height, input_width, 4))
 
     # ─── Encoder (Downsampling) ──────────────────────────────────────
     # Block 1: n_filters
@@ -159,7 +159,7 @@ def build_unet(n_classes, input_height=224, input_width=224,
 
 
 if __name__ == "__main__":
-    model = build_unet(25, 224, 224)
+    model = build_unet(7, 224, 224)
     model.summary()
     print(f"\nTotal parameters: {model.count_params():,}")
     print(f"Input:  {model.input_shape}")

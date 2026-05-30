@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-RUGD Dataset Loader for Semantic Segmentation.
+RELLIS-3D Dataset Loader for Semantic Segmentation with Early Fusion.
 
-Loads images from RUGD_frames-with-annotations/ and color-coded annotation
-masks from RUGD_annotations/, converting RGB colors to class indices using
-the 25-class RUGD colormap.
+Loads RGB images from rgb/, Depth images from depth/, and color/1D annotations
+from annotations/, converting them to the 6 kinematic class ontology + Void
+using an Early Fusion (4-channel) architecture.
 """
 
 import os
@@ -13,111 +13,82 @@ import cv2
 import numpy as np
 import tensorflow as tf
 
-# ─── RUGD 25‑class colormap (RGB) from RUGD_annotation-colormap.txt ─────────
-RUGD_CLASSES = [
-    "void", "dirt", "sand", "grass", "tree", "pole", "water", "sky",
-    "vehicle", "container/generic-object", "asphalt", "gravel", "building",
-    "mulch", "rock-bed", "log", "bicycle", "person", "fence", "bush",
-    "sign", "rock", "bridge", "concrete", "picnic-table"
+# ─── Kinematic Ontology (K=6) ───────────────────────────────────────────────
+KINEMATIC_CLASSES = [
+    "Rigid Drivable",      # 0 (Asphalt, Concrete)
+    "Granular Drivable",   # 1 (Dirt, Gravel)
+    "Vegetation Drivable", # 2 (Grass)
+    "Deformable Hazard",   # 3 (Mud, Puddle)
+    "Non-Drivable Nature", # 4 (Tree, Bush, Water, Log)
+    "Non-Drivable Rigid",  # 5 (Barrier, Rubble, Building, Fence, Vehicle, Person, Object, Pole)
+    "Void"                 # 6 (Sky, Unlabeled, etc.)
 ]
 
-# (R, G, B) tuples – order matches class index 0..24
-RUGD_COLORMAP_RGB = np.array([
-    [0,     0,   0],  # 0  void
-    [108,  64,  20],  # 1  dirt
-    [255, 229, 204],  # 2  sand
-    [0,   102,   0],  # 3  grass
-    [0,   255,   0],  # 4  tree
-    [0,   153, 153],  # 5  pole
-    [0,   128, 255],  # 6  water
-    [0,     0, 255],  # 7  sky
-    [255, 255,   0],  # 8  vehicle
-    [255,   0, 127],  # 9  container/generic-object
-    [64,   64,  64],  # 10 asphalt
-    [255, 128,   0],  # 11 gravel
-    [255,   0,   0],  # 12 building
-    [153,  76,   0],  # 13 mulch
-    [102, 102,   0],  # 14 rock-bed
-    [102,   0,   0],  # 15 log
-    [0,   255, 128],  # 16 bicycle
-    [204, 153, 255],  # 17 person
-    [102,   0, 204],  # 18 fence
-    [255, 153, 204],  # 19 bush
-    [0,   102, 102],  # 20 sign
-    [153, 204, 255],  # 21 rock
-    [102, 255, 255],  # 22 bridge
-    [101, 101,  11],  # 23 concrete
-    [114,  85,  47],  # 24 picnic-table
+NUM_CLASSES = 6 # The active K=6 kinematic classes models predict on (0-5)
+TOTAL_CLASSES = 7 # Including Void
+
+KINEMATIC_COLORMAP = np.array([
+    [128, 128, 128],  # 0: Rigid Drivable (Gray)
+    [139,  69,  19],  # 1: Granular Drivable (Brown)
+    [  0, 255,   0],  # 2: Vegetation Drivable (Green)
+    [255, 140,   0],  # 3: Deformable Hazard (Orange/Dark Mud)
+    [  0, 100,   0],  # 4: Non-Drivable Nature (Dark Green)
+    [255,   0,   0],  # 5: Non-Drivable Rigid (Red)
+    [  0,   0,   0]   # 6: Void (Black)
 ], dtype=np.uint8)
 
-NUM_CLASSES = len(RUGD_CLASSES)  # 25
+# Map original RELLIS-3D IDs (0-34) to Kinematic classes (0-6)
+RELLIS_MAPPING = {
+    0: 6,    # void
+    1: 1,    # dirt -> Granular
+    3: 2,    # grass -> Vegetation
+    4: 4,    # tree -> Nature
+    5: 5,    # pole -> Rigid Obstacle
+    6: 4,    # water -> Nature
+    7: 6,    # sky -> Void
+    8: 5,    # vehicle -> Rigid Obstacle
+    9: 5,    # object -> Rigid Obstacle
+    10: 0,   # asphalt -> Rigid
+    12: 5,   # building -> Rigid Obstacle
+    15: 4,   # log -> Nature
+    17: 5,   # person -> Rigid Obstacle
+    18: 5,   # fence -> Rigid Obstacle
+    19: 4,   # bush -> Nature
+    23: 0,   # concrete -> Rigid
+    27: 5,   # barrier -> Rigid Obstacle
+    31: 3,   # puddle -> Deformable Hazard
+    33: 3,   # mud -> Deformable Hazard
+    34: 5    # rubble -> Rigid Obstacle
+}
 
-# Default train / val / test split by sequence name
-DEFAULT_TRAIN_SEQS = [
-    "park-1", "park-2", "park-8",
-    "trail", "trail-3", "trail-4", "trail-5", "trail-6", "trail-7",
-    "trail-11", "trail-12", "trail-13", "trail-14", "trail-15",
-    "village",
-]
-DEFAULT_VAL_SEQS = ["trail-9", "trail-10"]
-DEFAULT_TEST_SEQS = ["creek"]
+# Precompute mapping array for fast vectorized lookup
+MAPPING_LUT = np.full(256, 6, dtype=np.uint8)
+for k, v in RELLIS_MAPPING.items():
+    MAPPING_LUT[k] = v
 
-# Normalization (same as Vitis AI tutorial)
 NORM_FACTOR = 127.5
 
-# ─── Helper: RGB mask → class index map ─────────────────────────────────────
-
-def _build_color_to_class_lut():
-    """Build a lookup table from (R,G,B) tuple to class index."""
-    lut = {}
-    for idx, rgb in enumerate(RUGD_COLORMAP_RGB):
-        lut[tuple(rgb)] = idx
-    return lut
-
-_COLOR_TO_CLASS = _build_color_to_class_lut()
-
-
-def rgb_mask_to_class_index(mask_rgb):
-    """
-    Convert an RGB annotation mask (H, W, 3) to a class index map (H, W).
-
-    Uses a vectorized approach: builds a single uint32 key from R,G,B and
-    looks up via a pre-built array.
-    """
-    # Build a flat lookup array indexed by packed RGB
-    # Pack: key = R * 256*256 + G * 256 + B
-    flat_lut = np.zeros(256 * 256 * 256, dtype=np.uint8)
-    for rgb_tuple, cls_idx in _COLOR_TO_CLASS.items():
-        key = rgb_tuple[0] * 65536 + rgb_tuple[1] * 256 + rgb_tuple[2]
-        flat_lut[key] = cls_idx
-
-    # Convert mask to uint32 keys
-    r = mask_rgb[:, :, 0].astype(np.uint32)
-    g = mask_rgb[:, :, 1].astype(np.uint32)
-    b = mask_rgb[:, :, 2].astype(np.uint32)
-    keys = r * 65536 + g * 256 + b
-
-    return flat_lut[keys]
-
+def rellis_mask_to_kinematic(mask_1d):
+    """Map a 1D label mask containing RELLIS IDs to the 6 kinematic classes + Void."""
+    return MAPPING_LUT[mask_1d]
 
 def class_index_to_rgb(class_map):
     """Convert a class index map (H, W) back to an RGB image (H, W, 3)."""
     h, w = class_map.shape
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
-    for c in range(NUM_CLASSES):
+    for c in range(TOTAL_CLASSES):
         mask = class_map == c
-        rgb[mask] = RUGD_COLORMAP_RGB[c]
+        rgb[mask] = KINEMATIC_COLORMAP[c]
     return rgb
-
 
 # ─── Keras Sequence Data Generator ──────────────────────────────────────────
 
-class RUGDDataset(tf.keras.utils.Sequence):
+class RELLIS3DDataset(tf.keras.utils.Sequence):
     """
-    Keras Sequence generator for the RUGD dataset.
+    Keras Sequence generator for RELLIS-3D with early fusion (RGB + Depth).
 
     Args:
-        data_root:  Path to the RUGD directory (containing RUGD_frames-with-annotations/ and RUGD_annotations/)
+        data_root:  Standard structure containing rgb/, depth/, and annotations/
         split:      'train', 'val', or 'test'
         batch_size: Batch size
         img_size:   (height, width) tuple
@@ -130,96 +101,153 @@ class RUGDDataset(tf.keras.utils.Sequence):
         self.batch_size = batch_size
         self.img_size = img_size  # (H, W)
         self.augment = augment
-        self.n_classes = NUM_CLASSES
+        self.n_classes = NUM_CLASSES # 6 active classes
+        self.total_classes = TOTAL_CLASSES # 7 including void
 
-        frames_dir = os.path.join(data_root, "RUGD_frames-with-annotations")
-        annot_dir = os.path.join(data_root, "RUGD_annotations")
+        self.rgb_dir = os.path.join(data_root, "rgb")
+        self.depth_dir = os.path.join(data_root, "depth")
+        self.annot_dir = os.path.join(data_root, "annotations")
 
+        self.rgb_paths = []
+        self.depth_paths = []
+        self.annot_paths = []
+
+        if not os.path.exists(self.rgb_dir):
+            print(f"WARNING: RELLIS-3D rgb dir not found: {self.rgb_dir}")
+            return
+            
+        all_rgb_files = sorted(os.listdir(self.rgb_dir))
+        
+        # Simple split logic if explicit lists aren't used:
+        # 80% train, 10% val, 10% test
+        np.random.seed(42) # Consistent splits
+        shuffled_files = all_rgb_files.copy()
+        np.random.shuffle(shuffled_files)
+        
+        n_total = len(shuffled_files)
+        n_train = int(0.8 * n_total)
+        n_val = int(0.1 * n_total)
+        
         if split == "train":
-            seqs = DEFAULT_TRAIN_SEQS
+            split_files = shuffled_files[:n_train]
         elif split == "val":
-            seqs = DEFAULT_VAL_SEQS
-        elif split == "test":
-            seqs = DEFAULT_TEST_SEQS
-        else:
-            raise ValueError(f"Unknown split: {split}")
+            split_files = shuffled_files[n_train:n_train+n_val]
+        else: # test
+            split_files = shuffled_files[n_train+n_val:]
 
-        self.image_paths = []
-        self.mask_paths = []
-        for seq in seqs:
-            seq_frames = os.path.join(frames_dir, seq)
-            seq_annots = os.path.join(annot_dir, seq)
-            if not os.path.isdir(seq_frames):
-                print(f"WARNING: sequence directory not found: {seq_frames}")
-                continue
-            if not os.path.isdir(seq_annots):
-                print(f"WARNING: annotation directory not found: {seq_annots}")
-                continue
-            fnames = sorted(os.listdir(seq_frames))
-            annot_fnames = set(os.listdir(seq_annots))
-            for fn in fnames:
-                if fn in annot_fnames:
-                    self.image_paths.append(os.path.join(seq_frames, fn))
-                    self.mask_paths.append(os.path.join(seq_annots, fn))
+        for fname in split_files:
+            base = os.path.splitext(fname)[0]
+            rgb_path = os.path.join(self.rgb_dir, fname)
+            # Find matching depth and annot. Extension could be png or jpg.
+            depth_path = os.path.join(self.depth_dir, base + ".png")
+            if not os.path.exists(depth_path):
+                 depth_path = os.path.join(self.depth_dir, base + ".jpg")
+                 
+            annot_path = os.path.join(self.annot_dir, base + ".png")
+            if not os.path.exists(annot_path):
+                 annot_path = os.path.join(self.annot_dir, base + ".jpg")
 
-        print(f"[RUGDDataset] split={split}, images={len(self.image_paths)}")
+            if os.path.exists(rgb_path) and os.path.exists(depth_path) and os.path.exists(annot_path):
+                self.rgb_paths.append(rgb_path)
+                self.depth_paths.append(depth_path)
+                self.annot_paths.append(annot_path)
+
+        print(f"[RELLIS3DDataset] split={split}, explicitly matching items={len(self.rgb_paths)}")
 
     def __len__(self):
-        return int(np.ceil(len(self.image_paths) / self.batch_size))
+        return int(np.ceil(len(self.rgb_paths) / self.batch_size))
 
     def __getitem__(self, idx):
         start = idx * self.batch_size
-        end = min(start + self.batch_size, len(self.image_paths))
+        end = min(start + self.batch_size, len(self.rgb_paths))
 
         X_batch = []
         Y_batch = []
         for i in range(start, end):
-            img = self._load_image(self.image_paths[i])
-            mask = self._load_mask(self.mask_paths[i])
+            # Load and process inputs
+            rgb_norm = self._load_rgb(self.rgb_paths[i])
+            depth_norm = self._load_depth(self.depth_paths[i])
+            # Early Fusion: Concatenate RGB and Depth -> (H, W, 4)
+            fused_input = np.concatenate([rgb_norm, depth_norm], axis=-1)
+
+            # Load and process masks
+            mask_categorical = self._load_mask(self.annot_paths[i])
 
             if self.augment and np.random.rand() > 0.5:
-                img = np.fliplr(img)
-                mask = np.fliplr(mask)
+                fused_input = np.fliplr(fused_input)
+                mask_categorical = np.fliplr(mask_categorical)
 
-            X_batch.append(img)
-            Y_batch.append(mask)
+            X_batch.append(fused_input)
+            Y_batch.append(mask_categorical)
 
         return np.array(X_batch), np.array(Y_batch)
 
-    def _load_image(self, path):
-        """Load and normalize image to [-1, 1]."""
+    def _load_rgb(self, path):
+        """Load and normalize RGB image to [-1, 1]."""
         img = cv2.imread(path, cv2.IMREAD_COLOR)  # BGR
+        if img is None:
+            return np.zeros((self.img_size[0], self.img_size[1], 3), dtype=np.float32)
         img = cv2.resize(img, (self.img_size[1], self.img_size[0]))
         img = img.astype(np.float32) / NORM_FACTOR - 1.0
-        return img  # (H, W, 3) in BGR, range [-1, 1]
+        return img  # (H, W, 3) range [-1, 1]
+
+    def _load_depth(self, path):
+        """Load depth and normalize."""
+        depth = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            return np.zeros((self.img_size[0], self.img_size[1], 1), dtype=np.float32)
+            
+        depth = cv2.resize(depth, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
+        depth = depth.astype(np.float32)
+        
+        # Simple normalization map 16-bit to [-1.0, 1.0]
+        # In practice depending on the sensor range (e.g. 50m limit) this might be
+        # clamped or adaptive. Since the Vitis DPU handles max activations well with INT8 QAT,
+        # we'll map utilizing a standard UINT16 divisor assumption:
+        MAX_DEPTH_VAL = 65535.0
+        if depth.max() > 0:            
+             depth = depth / MAX_DEPTH_VAL * 2.0 - 1.0
+        else:
+             depth = depth * 0.0 - 1.0 # default to background distance
+             
+        return np.expand_dims(depth, axis=-1) # (H, W, 1)
 
     def _load_mask(self, path):
-        """Load annotation mask and convert to one-hot (H, W, C)."""
-        mask_bgr = cv2.imread(path, cv2.IMREAD_COLOR)  # BGR
-        mask_rgb = cv2.cvtColor(mask_bgr, cv2.COLOR_BGR2RGB)
-        mask_rgb = cv2.resize(mask_rgb, (self.img_size[1], self.img_size[0]),
-                              interpolation=cv2.INTER_NEAREST)
-        class_map = rgb_mask_to_class_index(mask_rgb)  # (H, W)
-        # One-hot encode
-        one_hot = np.zeros((self.img_size[0], self.img_size[1], self.n_classes),
-                           dtype=np.float32)
-        for c in range(self.n_classes):
+        """Load annotation mask and convert to one-hot for the active K=6 classes + Void."""
+        mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE) # RELLIS-3D provides ID-based masks
+        if mask is None:
+             # Return empty one-hot indicating Void everywhere
+             one_hot = np.zeros((self.img_size[0], self.img_size[1], self.total_classes), dtype=np.float32)
+             one_hot[:, :, 6] = 1.0
+             return one_hot
+             
+        mask = cv2.resize(mask, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
+        
+        class_map = rellis_mask_to_kinematic(mask)
+        
+        # One-hot encode for all 7 classes (including void)
+        one_hot = np.zeros((self.img_size[0], self.img_size[1], self.total_classes), dtype=np.float32)
+        for c in range(self.total_classes):
             one_hot[:, :, c] = (class_map == c).astype(np.float32)
+            
         return one_hot
 
     def get_all_data(self, max_images=None):
-        """Load all images and masks into numpy arrays (for small datasets)."""
-        n = len(self.image_paths) if max_images is None else min(max_images, len(self.image_paths))
-        X = np.zeros((n, self.img_size[0], self.img_size[1], 3), dtype=np.float32)
-        Y = np.zeros((n, self.img_size[0], self.img_size[1], self.n_classes), dtype=np.float32)
+        """Load all images into numpy arrays."""
+        n = len(self.rgb_paths) if max_images is None else min(max_images, len(self.rgb_paths))
+        X = np.zeros((n, self.img_size[0], self.img_size[1], 4), dtype=np.float32)
+        Y = np.zeros((n, self.img_size[0], self.img_size[1], self.total_classes), dtype=np.float32)
         for i in range(n):
-            X[i] = self._load_image(self.image_paths[i])
-            Y[i] = self._load_mask(self.mask_paths[i])
+            rgb = self._load_rgb(self.rgb_paths[i])
+            depth = self._load_depth(self.depth_paths[i])
+            X[i] = np.concatenate([rgb, depth], axis=-1)
+            Y[i] = self._load_mask(self.annot_paths[i])
         return X, Y
 
     def on_epoch_end(self):
         """Shuffle data at end of each epoch."""
-        indices = np.arange(len(self.image_paths))
+        indices = np.arange(len(self.rgb_paths))
         np.random.shuffle(indices)
-        self.image_paths = [self.image_paths[i] for i in indices]
-        self.mask_paths = [self.mask_paths[i] for i in indices]
+        self.rgb_paths = [self.rgb_paths[i] for i in indices]
+        self.depth_paths = [self.depth_paths[i] for i in indices]
+        self.annot_paths = [self.annot_paths[i] for i in indices]
