@@ -93,10 +93,11 @@ class RELLIS3DDataset(tf.keras.utils.Sequence):
         batch_size: Batch size
         img_size:   (height, width) tuple
         augment:    Whether to apply data augmentation (horizontal flip)
+        max_samples: Maximum number of samples to load (useful for testing)
     """
 
     def __init__(self, data_root, split="train", batch_size=8,
-                 img_size=(224, 224), augment=False):
+                 img_size=(224, 224), augment=False, max_samples=None):
         self.data_root = data_root
         self.batch_size = batch_size
         self.img_size = img_size  # (H, W)
@@ -151,6 +152,11 @@ class RELLIS3DDataset(tf.keras.utils.Sequence):
                 self.rgb_paths.append(rgb_path)
                 self.depth_paths.append(depth_path)
                 self.annot_paths.append(annot_path)
+
+        if max_samples is not None:
+            self.rgb_paths = self.rgb_paths[:max_samples]
+            self.depth_paths = self.depth_paths[:max_samples]
+            self.annot_paths = self.annot_paths[:max_samples]
 
         print(f"[RELLIS3DDataset] split={split}, explicitly matching items={len(self.rgb_paths)}")
 

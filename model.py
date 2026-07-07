@@ -10,6 +10,17 @@ Architecture: UNET v2 with batch normalization and dropout.
 """
 
 import os
+# Configure environment for local tensorflow/nvidia CUDA libraries if not already set
+if 'XLA_FLAGS' not in os.environ:
+    try:
+        import nvidia
+        nvidia_path = list(nvidia.__path__)[0]
+        cuda_nvcc_dir = os.path.join(nvidia_path, 'cuda_nvcc')
+        if os.path.isdir(cuda_nvcc_dir):
+            os.environ['XLA_FLAGS'] = f'--xla_gpu_cuda_data_dir={cuda_nvcc_dir}'
+    except Exception:
+        pass
+
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 import tensorflow as tf

@@ -9,6 +9,17 @@ Usage:
 """
 
 import os
+# Configure environment for local tensorflow/nvidia CUDA libraries if not already set
+if 'XLA_FLAGS' not in os.environ:
+    try:
+        import nvidia
+        nvidia_path = list(nvidia.__path__)[0]
+        cuda_nvcc_dir = os.path.join(nvidia_path, 'cuda_nvcc')
+        if os.path.isdir(cuda_nvcc_dir):
+            os.environ['XLA_FLAGS'] = f'--xla_gpu_cuda_data_dir={cuda_nvcc_dir}'
+    except Exception:
+        pass
+
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 import sys
@@ -40,7 +51,7 @@ from model import build_unet
 
 # ─── Heuristic Inverse Frequency Class Weights ──────────────────────────────
 # 0: Rigid, 1: Granular, 2: Veg, 3: Hazard, 4: Nature, 5: Rigid_Obstacle, 6: Void
-CLASS_WEIGHTS = [1.5, 1.0, 0.2, 10.0, 0.5, 3.0, 0.0]
+CLASS_WEIGHTS = [1.5, 1.0, 0.2, 3.0, 0.5, 3.0, 0.0]
 
 def get_weighted_categorical_crossentropy(weights):
     def loss(y_true, y_pred):
@@ -70,6 +81,8 @@ def parse_args():
                     help="Input image width")
     ap.add_argument("--output_dir", default="output",
                     help="Directory for output files (models, plots)")
+    ap.add_argument("--max_samples", type=int, default=None,
+                    help="Limit the number of samples per dataset split (for testing)")
     return ap.parse_args()
 
 
@@ -92,7 +105,7 @@ def compute_iou(y_true_idx, y_pred_idx, n_classes, class_names):
         ious.append(iou)
     valid_ious = [x for x in ious if not np.isnan(x)]
     mean_iou = np.mean(valid_ious) if valid_ious else 0.0
-    print(f"  {'─' * 60}")
+    print(f"  {'-' * 60}")
     print(f"  Mean IoU (Active {n_classes} Classes): {mean_iou:.3f}")
     return mean_iou, ious
 
@@ -127,13 +140,16 @@ def main():
     print("Loading datasets...")
     train_gen = RELLIS3DDataset(args.data_root, split="train",
                            batch_size=args.batch_size,
-                           img_size=img_size, augment=True)
+                           img_size=img_size, augment=True,
+                           max_samples=args.max_samples)
     val_gen = RELLIS3DDataset(args.data_root, split="val",
                          batch_size=args.batch_size,
-                         img_size=img_size, augment=False)
+                         img_size=img_size, augment=False,
+                         max_samples=args.max_samples)
     test_gen = RELLIS3DDataset(args.data_root, split="test",
                           batch_size=args.batch_size,
-                          img_size=img_size, augment=False)
+                          img_size=img_size, augment=False,
+                          max_samples=args.max_samples)
     print()
 
     # ── Model ────────────────────────────────────────────────────────
@@ -158,7 +174,7 @@ def main():
     # ── Callbacks ────────────────────────────────────────────────────
     keras_path = os.path.join(
         keras_model_dir,
-        f"ep{args.epochs}_trained_unet_v2_rgbd_{args.img_width}x{args.img_height}.keras"
+        f"ep{args.epochs}_trained_unet_v2_{args.img_width}x{args.img_height}.keras"
     )
     callbacks = [
         ModelCheckpoint(keras_path, monitor='val_loss',
@@ -189,7 +205,7 @@ def main():
     # ── Save final model ─────────────────────────────────────────────
     final_keras = os.path.join(
         keras_model_dir,
-        f"ep{args.epochs}_final_unet_v2_rgbd_{args.img_width}x{args.img_height}.keras"
+        f"ep{args.epochs}_final_unet_v2_{args.img_width}x{args.img_height}.keras"
     )
     model.save(final_keras)
     print(f"Final model saved (.keras): {final_keras}")
@@ -197,7 +213,7 @@ def main():
     # Also save as legacy HDF5 for Vitis AI Docker (TF1.15 compatibility)
     final_h5 = os.path.join(
         keras_model_dir,
-        f"ep{args.epochs}_final_unet_v2_rgbd_{args.img_width}x{args.img_height}.h5"
+        f"ep{args.epochs}_final_unet_v2_{args.img_width}x{args.img_height}.h5"
     )
     model.save(final_h5)
     print(f"Final model saved (.h5):    {final_h5}")
@@ -205,6 +221,31 @@ def main():
     # Also save as SavedModel format (for TF2-based Vitis AI flows)
     model.export(saved_model_dir)
     print(f"SavedModel exported: {saved_model_dir}")
+
+    # ── Training curves ──────────────────────────────────────────────
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    axes[0].plot(history.history['loss'], label='train_loss')
+    axes[0].plot(history.history['val_loss'], label='val_loss')
+    axes[0].set_title('Loss')
+    axes[0].set_xlabel('Epoch')
+    axes[0].legend()
+    axes[0].grid(True)
+
+    axes[1].plot(history.history['accuracy'], label='train_acc')
+    axes[1].plot(history.history['val_accuracy'], label='val_acc')
+    axes[1].set_title('Accuracy')
+    axes[1].set_xlabel('Epoch')
+    axes[1].legend()
+    axes[1].grid(True)
+
+    plt.tight_layout()
+    curves_path = os.path.join(
+        rpt_dir,
+        f"unet_v2_training_curves_{args.img_width}x{args.img_height}.png"
+    )
+    plt.savefig(curves_path, dpi=150)
+    print(f"Training curves saved: {curves_path}")
 
     # ── Evaluate on test set ─────────────────────────────────────────
     print("\nEvaluating on test set...")

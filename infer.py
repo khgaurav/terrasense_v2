@@ -9,6 +9,17 @@ Usage:
 """
 
 import os
+# Configure environment for local tensorflow/nvidia CUDA libraries if not already set
+if 'XLA_FLAGS' not in os.environ:
+    try:
+        import nvidia
+        nvidia_path = list(nvidia.__path__)[0]
+        cuda_nvcc_dir = os.path.join(nvidia_path, 'cuda_nvcc')
+        if os.path.isdir(cuda_nvcc_dir):
+            os.environ['XLA_FLAGS'] = f'--xla_gpu_cuda_data_dir={cuda_nvcc_dir}'
+    except Exception:
+        pass
+
 import sys
 import argparse
 import numpy as np
@@ -29,7 +40,7 @@ from dataset import (
 
 def parse_args():
     ap = argparse.ArgumentParser(description="UNET RELLIS-3D inference (RGBD)")
-    ap.add_argument("--model", default="output/keras_model/ep50_trained_unet_v2_rgbd_224x224.keras",
+    ap.add_argument("--model", default="output/keras_model/ep50_trained_unet_v2_224x224.keras",
                     help="Path to trained .keras model")
     ap.add_argument("--image", default=None,
                     help="Path to a single RGB image for inference")
@@ -107,7 +118,7 @@ def compute_iou(y_true_idx, y_pred_idx, n_classes, class_names):
         ious.append(iou)
     valid_ious = [x for x in ious if not np.isnan(x)]
     mean_iou = np.mean(valid_ious) if valid_ious else 0.0
-    print(f"  {'─' * 60}")
+    print(f"  {'-' * 60}")
     print(f"  Mean IoU: {mean_iou:.3f}")
     return mean_iou
 
