@@ -10,7 +10,7 @@ echo "Downloading Images (11GB)..."
 gdown "1F3Leu0H_m6aPVpZITragfreO_SGtL2yV" -O /tmp/rellis/images.zip || { echo "Failed to download images"; exit 1; }
 
 echo "Extracting Datasets..."
-rm -rf data/RELLIS-3D_full
+rm -rf data/RELLIS-3D_full/{rgb,annotations,depth}
 mkdir -p data/RELLIS-3D_full/{rgb,annotations,depth}
 
 unzip -q /tmp/rellis/annotations.zip -d /tmp/rellis/annot_ex
@@ -21,14 +21,8 @@ find /tmp/rellis/img_ex -type f -name "*.jpg" -exec mv {} data/RELLIS-3D_full/rg
 find /tmp/rellis/annot_ex -type f -name "*.png" -exec mv {} data/RELLIS-3D_full/annotations/ \;
 find /tmp/rellis/annot_ex -type f -name "*.jpg" -exec mv {} data/RELLIS-3D_full/annotations/ \;
 
-echo "Creating Dummy Depth Maps to Satisfy RGB-D Architecture..."
-# Only create depth maps for matching pairs to ensure validation generator has consistent numbers
-for f in data/RELLIS-3D_full/rgb/*.jpg; do
-    base=$(basename "$f" .jpg)
-    if [ -f "data/RELLIS-3D_full/annotations/${base}.png" ] || [ -f "data/RELLIS-3D_full/annotations/${base}.jpg" ]; then
-        touch "data/RELLIS-3D_full/depth/${base}.jpg"
-    fi
-done
+echo "Projecting LiDAR Point Clouds to Generate 2D Depth Maps..."
+python3 generate_depth.py
 
 echo "Cleaning up temporary files..."
 rm -rf /tmp/rellis

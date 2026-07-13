@@ -23,6 +23,8 @@
 
 set -euo pipefail
 
+export PATH=/opt/vitis_ai/conda/envs/vitis-ai-tensorflow/bin:$PATH
+
 CONDA_PYTHON=/opt/vitis_ai/conda/envs/vitis-ai-tensorflow/bin/python
 VAI_Q=/opt/vitis_ai/conda/envs/vitis-ai-tensorflow/bin/vai_q_tensorflow
 VAI_C=/opt/vitis_ai/conda/envs/vitis-ai-tensorflow/bin/vai_c_tensorflow
@@ -31,16 +33,23 @@ FROZEN_PB="${1:-build_vai/freeze/frozen_graph.pb}"
 CALIB_DIR="${2:-data/RELLIS-3D_full}"
 CALIB_ITER="${3:-10}"
 
-BUILD_DIR="build_vai"
-QUANT_DIR="${BUILD_DIR}/quantized"
-COMPILE_DIR="${BUILD_DIR}/compiled"
-TARGET_DIR="${BUILD_DIR}/target_zcu102/model"
 NET_NAME="terrasense_unet"
 ARCH="/opt/vitis_ai/compiler/arch/DPUCZDX8G/ZCU102/arch.json"
 
 INPUT_NODE="input_1"
 OUTPUT_NODE="Identity"
 INPUT_SHAPES="?,224,224,4"
+
+# Internal container paths to avoid NTFS permission/lock issues
+TMP_FREEZE_DIR="/tmp/freeze"
+TMP_QUANT_DIR="/tmp/quantized"
+TMP_COMPILE_DIR="/tmp/compiled"
+
+# Workspace output paths
+BUILD_DIR="build_vai"
+QUANT_DIR="${BUILD_DIR}/quantized"
+COMPILE_DIR="${BUILD_DIR}/compiled"
+TARGET_DIR="${BUILD_DIR}/target_zcu102/model"
 
 echo "======================================================================"
 echo "  TerraSense RGB UNet  →  ZCU102 (Vitis AI TF1 flow)"
@@ -55,14 +64,19 @@ echo "======================================================================"
 [ -d "${CALIB_DIR}" ] || { echo "ERROR: calib dir not found: ${CALIB_DIR}"; exit 1; }
 [ -f "${ARCH}" ]      || { echo "ERROR: arch.json not found: ${ARCH}"; exit 1; }
 
+mkdir -p "${TMP_FREEZE_DIR}" "${TMP_QUANT_DIR}" "${TMP_COMPILE_DIR}"
 mkdir -p "${QUANT_DIR}" "${COMPILE_DIR}" "${TARGET_DIR}"
+
+# Copy frozen graph to tmp
+cp "${FROZEN_PB}" "${TMP_FREEZE_DIR}/frozen_graph.pb"
+TMP_FROZEN_PB="${TMP_FREEZE_DIR}/frozen_graph.pb"
 
 # ── Step 1: Inspect frozen graph ─────────────────────────────────────────────
 echo ""
 echo "======================================================================"
 echo "Step 1/3: Inspect frozen graph"
 echo "======================================================================"
-${VAI_Q} inspect --input_frozen_graph "${FROZEN_PB}"
+${VAI_Q} inspect --input_frozen_graph "${TMP_FROZEN_PB}"
 
 # ── Step 2: Quantise (FP32 → INT8) ───────────────────────────────────────────
 echo ""
@@ -76,17 +90,22 @@ export CALIB_DIR="${CALIB_DIR}"
 export INPUT_SHAPES="${INPUT_SHAPES}"
 
 ${VAI_Q} quantize \
-    --input_frozen_graph  "${FROZEN_PB}"          \
+    --input_frozen_graph  "${TMP_FROZEN_PB}"      \
     --input_nodes         "${INPUT_NODE}"          \
     --input_shapes        "${INPUT_SHAPES}"        \
     --output_nodes        "${OUTPUT_NODE}"         \
-    --output_dir          "${QUANT_DIR}"           \
+    --output_dir          "${TMP_QUANT_DIR}"       \
     --method              1                        \
     --input_fn            vitis_ai.graph_input_fn.calib_input \
     --calib_iter          "${CALIB_ITER}"          \
     --gpu                 0
 
+TMP_QUANT_PB="${TMP_QUANT_DIR}/quantize_eval_model.pb"
+# Copy quantized model and logs back to workspace
+cp "${TMP_QUANT_PB}" "${QUANT_DIR}/"
+cp -r "${TMP_QUANT_DIR}/"* "${QUANT_DIR}/" 2>/dev/null || true
 QUANT_PB="${QUANT_DIR}/quantize_eval_model.pb"
+
 echo ""
 echo "Quantized model: ${QUANT_PB}"
 
@@ -97,11 +116,14 @@ echo "Step 3/3: Compile for ZCU102 DPUCZDX8G with vai_c_tensorflow"
 echo "======================================================================"
 
 ${VAI_C} \
-    --frozen_pb   "${QUANT_PB}"   \
+    --frozen_pb   "${TMP_QUANT_PB}" \
     --arch        "${ARCH}"       \
-    --output_dir  "${COMPILE_DIR}" \
+    --output_dir  "${TMP_COMPILE_DIR}" \
     --options     "{'mode':'normal'}" \
     --net_name    "${NET_NAME}"
+
+# Copy compiled results back to workspace
+cp -r "${TMP_COMPILE_DIR}/"* "${COMPILE_DIR}/"
 
 # Copy artefacts to target directory
 cp "${COMPILE_DIR}/${NET_NAME}.xmodel"    "${TARGET_DIR}/"

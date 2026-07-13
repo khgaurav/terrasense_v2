@@ -40,7 +40,7 @@ if gpus:
     except RuntimeError as e:
         print(e)
         
-from tensorflow.keras.optimizers import SGD
+from tensorflow.keras.optimizers import SGD, Adam
 from tensorflow.keras.callbacks import (
     ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
 )
@@ -49,18 +49,28 @@ import tensorflow.keras.backend as K
 from dataset import RELLIS3DDataset, NUM_CLASSES, TOTAL_CLASSES, KINEMATIC_CLASSES
 from model import build_unet
 
-# ─── Heuristic Inverse Frequency Class Weights ──────────────────────────────
-# 0: Rigid, 1: Granular, 2: Veg, 3: Hazard, 4: Nature, 5: Rigid_Obstacle, 6: Void
-CLASS_WEIGHTS = [1.5, 1.0, 0.2, 3.0, 0.5, 3.0, 0.0]
+# ─── Heuristic Weighted Focal Loss ──────────────────────────────────────────
+# 0: Smooth Drivable, 1: Grass, 2: Dirt, 3: Sand, 4: Gravel, 5: Mulch, 6: Puddle, 7: Mud, 8: Soft Obstacle, 9: Obstacle, 10: Void
+# Heavily penalise errors on underrepresented classes (Granular/Rough = 15.0, Puddle/Mud = 5.0)
+CLASS_WEIGHTS = [3.0, 0.1, 15.0, 15.0, 15.0, 15.0, 5.0, 5.0, 0.3, 0.4, 0.0]
 
-def get_weighted_categorical_crossentropy(weights):
+def get_weighted_focal_loss(weights, gamma=2.0):
     def loss(y_true, y_pred):
-        # Vitis-AI model outputs ReLU, we must apply Softmax for CE loss
+        # Cast inputs to float32 to avoid numerical underflow in float16
+        y_pred = tf.cast(y_pred, tf.float32)
+        y_true = tf.cast(y_true, tf.float32)
+        
+        # Vitis-AI model outputs ReLU, we must apply Softmax for loss computation
         y_pred_softmax = tf.nn.softmax(y_pred, axis=-1)
         y_pred_softmax = K.clip(y_pred_softmax, K.epsilon(), 1.0 - K.epsilon())
         weights_tensor = K.constant(weights)
-        cce = -y_true * K.log(y_pred_softmax) * weights_tensor
-        return K.mean(K.sum(cce, axis=-1))
+        
+        # Focal factor: (1 - p)**gamma
+        focal_term = K.pow(1.0 - y_pred_softmax, gamma)
+        
+        # Weighted Categorical Cross Entropy with Focal factor
+        weighted_loss = -y_true * focal_term * K.log(y_pred_softmax) * weights_tensor
+        return K.mean(K.sum(weighted_loss, axis=-1))
     return loss
 
 # ─── Argument parsing ───────────────────────────────────────────────────────
@@ -73,8 +83,10 @@ def parse_args():
                     help="Number of training epochs")
     ap.add_argument("--batch_size", type=int, default=8,
                     help="Batch size")
-    ap.add_argument("--lr", type=float, default=0.01,
-                    help="Initial learning rate")
+    ap.add_argument("--optimizer", default="adam", choices=["adam", "sgd"],
+                    help="Optimizer to use (adam or sgd)")
+    ap.add_argument("--lr", type=float, default=None,
+                    help="Initial learning rate. Defaults to 0.001 for adam, 0.01 for sgd")
     ap.add_argument("--img_height", type=int, default=224,
                     help="Input image height")
     ap.add_argument("--img_width", type=int, default=224,
@@ -115,6 +127,12 @@ def compute_iou(y_true_idx, y_pred_idx, n_classes, class_names):
 def main():
     args = parse_args()
 
+    # Resolve learning rate based on optimizer
+    if args.lr is None:
+        lr_val = 0.001 if args.optimizer == "adam" else 0.01
+    else:
+        lr_val = args.lr
+
     # Create output directories
     os.makedirs(args.output_dir, exist_ok=True)
     keras_model_dir = os.path.join(args.output_dir, "keras_model")
@@ -130,7 +148,8 @@ def main():
     print("=" * 70)
     print(f"  Epochs:      {args.epochs}")
     print(f"  Batch size:  {args.batch_size}")
-    print(f"  Learning rate: {args.lr}")
+    print(f"  Optimizer:   {args.optimizer.upper()}")
+    print(f"  Learning rate: {lr_val}")
     print(f"  Image size:  {img_size}")
     print(f"  Classes:     {NUM_CLASSES} active (+ 1 Void)")
     print(f"  Output dir:  {args.output_dir}")
@@ -161,13 +180,16 @@ def main():
     print()
 
     # ── Compile ──────────────────────────────────────────────────────
-    sgd = SGD(learning_rate=args.lr, momentum=0.9, nesterov=True)
+    if args.optimizer == "adam":
+        opt = Adam(learning_rate=lr_val)
+    else:
+        opt = SGD(learning_rate=lr_val, momentum=0.9, nesterov=True)
     
-    custom_loss = get_weighted_categorical_crossentropy(CLASS_WEIGHTS)
+    custom_loss = get_weighted_focal_loss(CLASS_WEIGHTS, gamma=2.0)
     
     model.compile(
         loss=custom_loss,
-        optimizer=sgd,
+        optimizer=opt,
         metrics=['accuracy']
     )
 

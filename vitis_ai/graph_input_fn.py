@@ -28,8 +28,8 @@ BATCH_SIZE   = 10
 
 # Collect all image paths once at import time
 _all_paths = sorted(
-    glob.glob(os.path.join(CALIB_DIR, '**/*.png'), recursive=True) +
-    glob.glob(os.path.join(CALIB_DIR, '**/*.jpg'), recursive=True)
+    glob.glob(os.path.join(CALIB_DIR, 'rgb', '**/*.png'), recursive=True) +
+    glob.glob(os.path.join(CALIB_DIR, 'rgb', '**/*.jpg'), recursive=True)
 )
 
 if not _all_paths:
