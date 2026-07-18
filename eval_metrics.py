@@ -46,6 +46,10 @@ if args.model_type == "pb":
         import tensorflow.contrib.decent_q
     except ImportError:
         pass
+    try:
+        import vai_q_tensorflow
+    except ImportError:
+        pass
 else:
     print("Initializing TF2 Mode for Keras model...")
     import tensorflow as tf

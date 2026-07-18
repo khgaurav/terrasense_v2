@@ -52,7 +52,7 @@ from model import build_unet
 # ─── Heuristic Weighted Focal Loss ──────────────────────────────────────────
 # 0: Smooth Drivable, 1: Grass, 2: Dirt, 3: Sand, 4: Gravel, 5: Mulch, 6: Puddle, 7: Mud, 8: Soft Obstacle, 9: Obstacle, 10: Void
 # Heavily penalise errors on underrepresented classes (Granular/Rough = 15.0, Puddle/Mud = 5.0)
-CLASS_WEIGHTS = [3.0, 0.1, 15.0, 15.0, 15.0, 15.0, 5.0, 5.0, 0.3, 0.4, 0.0]
+CLASS_WEIGHTS = [3.0, 0.1, 15.0, 15.0, 15.0, 15.0, 5.0, 3.0, 0.3, 0.4, 0.0]
 
 def get_weighted_focal_loss(weights, gamma=2.0):
     def loss(y_true, y_pred):
@@ -71,6 +71,30 @@ def get_weighted_focal_loss(weights, gamma=2.0):
         # Weighted Categorical Cross Entropy with Focal factor
         weighted_loss = -y_true * focal_term * K.log(y_pred_softmax) * weights_tensor
         return K.mean(K.sum(weighted_loss, axis=-1))
+    return loss
+
+def get_weighted_focal_dice_loss(weights, gamma=2.0, dice_weight=1.0):
+    focal_loss_fn = get_weighted_focal_loss(weights, gamma)
+    def loss(y_true, y_pred):
+        f_loss = focal_loss_fn(y_true, y_pred)
+        
+        y_pred_cast = tf.cast(y_pred, tf.float32)
+        y_true_cast = tf.cast(y_true, tf.float32)
+        
+        y_pred_softmax = tf.nn.softmax(y_pred_cast, axis=-1)
+        y_pred_softmax = K.clip(y_pred_softmax, K.epsilon(), 1.0 - K.epsilon())
+        
+        intersection = K.sum(y_true_cast * y_pred_softmax, axis=[0, 1, 2])
+        total_sum = K.sum(K.square(y_true_cast) + K.square(y_pred_softmax), axis=[0, 1, 2])
+        
+        dice = (2.0 * intersection + K.epsilon()) / (total_sum + K.epsilon())
+        dice_loss = 1.0 - dice
+        
+        weights_tensor = K.constant(weights[:10])
+        weighted_dice = dice_loss[:10] * weights_tensor
+        
+        d_loss = K.mean(weighted_dice)
+        return f_loss + dice_weight * d_loss
     return loss
 
 # ─── Argument parsing ───────────────────────────────────────────────────────
@@ -185,7 +209,7 @@ def main():
     else:
         opt = SGD(learning_rate=lr_val, momentum=0.9, nesterov=True)
     
-    custom_loss = get_weighted_focal_loss(CLASS_WEIGHTS, gamma=2.0)
+    custom_loss = get_weighted_focal_dice_loss(CLASS_WEIGHTS, gamma=2.0, dice_weight=1.0)
     
     model.compile(
         loss=custom_loss,

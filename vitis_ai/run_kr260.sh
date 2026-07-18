@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# TerraSense RGB UNet → ZCU102 Deployment Pipeline (Vitis AI TF1 flow)
+# TerraSense RGB UNet → KR260 Deployment Pipeline (Vitis AI TF1 flow)
 #
 # TWO-STAGE PROCESS:
 #
@@ -13,7 +13,7 @@
 #     docker run --gpus all -it --rm \
 #       -v $(pwd):/workspace \
 #       xilinx/vitis-ai-tensorflow-gpu:3.5.0.001- bash -c \
-#       "cd /workspace && bash vitis_ai/run_zcu102.sh"
+#       "cd /workspace && bash vitis_ai/run_kr260.sh"
 #
 # ARGUMENTS (all optional)
 #   $1  Path to frozen graph .pb     default: build_vai/freeze/frozen_graph.pb
@@ -34,7 +34,7 @@ CALIB_DIR="${2:-data/RELLIS-3D_full}"
 CALIB_ITER="${3:-10}"
 
 NET_NAME="terrasense_unet"
-ARCH="/opt/vitis_ai/compiler/arch/DPUCZDX8G/ZCU102/arch.json"
+ARCH="/opt/vitis_ai/compiler/arch/DPUCZDX8G/KV260/arch.json"
 
 INPUT_NODE="input_1"
 OUTPUT_NODE="Identity"
@@ -49,10 +49,10 @@ TMP_COMPILE_DIR="/tmp/compiled"
 BUILD_DIR="build_vai"
 QUANT_DIR="${BUILD_DIR}/quantized"
 COMPILE_DIR="${BUILD_DIR}/compiled"
-TARGET_DIR="${BUILD_DIR}/target_zcu102/model"
+TARGET_DIR="${BUILD_DIR}/target_kr260/model"
 
 echo "======================================================================"
-echo "  TerraSense RGB UNet  →  ZCU102 (Vitis AI TF1 flow)"
+echo "  TerraSense RGB UNet  →  KR260 (Vitis AI TF1 flow)"
 echo "======================================================================"
 echo "  Frozen graph  : ${FROZEN_PB}"
 echo "  Calibration   : ${CALIB_DIR}  (${CALIB_ITER} batches × 10 images)"
@@ -98,7 +98,7 @@ ${VAI_Q} quantize \
     --method              1                        \
     --input_fn            vitis_ai.graph_input_fn.calib_input \
     --calib_iter          "${CALIB_ITER}"          \
-    --gpu                 0
+    --gpu                 "${GPU_ID:-0}"
 
 TMP_QUANT_PB="${TMP_QUANT_DIR}/quantize_eval_model.pb"
 # Copy quantized model and logs back to workspace
@@ -109,10 +109,10 @@ QUANT_PB="${QUANT_DIR}/quantize_eval_model.pb"
 echo ""
 echo "Quantized model: ${QUANT_PB}"
 
-# ── Step 3: Compile for ZCU102 ────────────────────────────────────────────────
+# ── Step 3: Compile for KR260 ────────────────────────────────────────────────
 echo ""
 echo "======================================================================"
-echo "Step 3/3: Compile for ZCU102 DPUCZDX8G with vai_c_tensorflow"
+echo "Step 3/3: Compile for KR260 DPUCZDX8G with vai_c_tensorflow"
 echo "======================================================================"
 
 ${VAI_C} \
@@ -130,8 +130,8 @@ cp "${COMPILE_DIR}/${NET_NAME}.xmodel"    "${TARGET_DIR}/"
 cp "${COMPILE_DIR}/${NET_NAME}.json"      "${TARGET_DIR}/" 2>/dev/null || true
 
 # Package for SCP to board
-TARBALL="${BUILD_DIR}/target_zcu102.tar.gz"
-tar -czf "${TARBALL}" "${BUILD_DIR}/target_zcu102/"
+TARBALL="${BUILD_DIR}/target_kr260.tar.gz"
+tar -czf "${TARBALL}" "${BUILD_DIR}/target_kr260/"
 
 echo ""
 echo "======================================================================"
@@ -141,7 +141,7 @@ echo "  Quantized model  : ${QUANT_PB}"
 echo "  Compiled xmodel  : ${TARGET_DIR}/${NET_NAME}.xmodel"
 echo "  Board tarball    : ${TARBALL}"
 echo ""
-echo "Deploy to ZCU102:"
-echo "  scp ${TARBALL} root@<board_ip>:~/"
-echo "  ssh root@<board_ip> 'tar -xzf target_zcu102.tar.gz'"
+echo "Deploy to KR260:"
+echo "  scp ${TARBALL} petalinux@<board_ip>:~/"
+echo "  ssh petalinux@<board_ip> 'tar -xzf target_kr260.tar.gz'"
 echo "======================================================================"
