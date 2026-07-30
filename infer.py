@@ -35,8 +35,11 @@ from tensorflow.keras.models import load_model
 
 from dataset import (
     RELLIS3DDataset, NUM_CLASSES, TOTAL_CLASSES, KINEMATIC_CLASSES, KINEMATIC_COLORMAP,
-    class_index_to_rgb, NORM_FACTOR
+    class_index_to_rgb, NORM_FACTOR, normalize_depth
 )
+
+# Kinematic Void index, used to skip the unlabelled class when annotating output.
+VOID_CLASS = TOTAL_CLASSES - 1
 
 def parse_args():
     ap = argparse.ArgumentParser(description="UNET RELLIS-3D inference (RGBD)")
@@ -54,6 +57,8 @@ def parse_args():
                     help="Directory for saving prediction outputs")
     ap.add_argument("--img_height", type=int, default=224)
     ap.add_argument("--img_width", type=int, default=224)
+    ap.add_argument("--batch_size", type=int, default=8,
+                    help="Batch size used by --eval_test")
     return ap.parse_args()
 
 
@@ -68,17 +73,13 @@ def predict_single_pair(model, image_path, depth_path, img_size=(224, 224)):
     img_resized = cv2.resize(img_orig, (img_size[1], img_size[0]))
     img_norm = img_resized.astype(np.float32) / NORM_FACTOR - 1.0
     
-    # Process Depth
+    # Process Depth. Must use the training-time scaling from dataset.py: this used
+    # to divide by 65535 while training divided by 10000, so every depth value the
+    # network saw at inference was ~6.5x smaller than during training.
     if depth_path and os.path.exists(depth_path):
         depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
         depth = cv2.resize(depth, (img_size[1], img_size[0]), interpolation=cv2.INTER_NEAREST)
-        depth = depth.astype(np.float32)
-        MAX_DEPTH_VAL = 65535.0
-        if depth.max() > 0:
-             depth_norm = depth / MAX_DEPTH_VAL * 2.0 - 1.0
-        else:
-             depth_norm = depth * 0.0 - 1.0
-        depth_norm = np.expand_dims(depth_norm, axis=-1)
+        depth_norm = normalize_depth(depth)
     else:
         print("WARNING: Depth image missing or invalid, using zero depth.")
         depth_norm = np.full((img_size[0], img_size[1], 1), -1.0, dtype=np.float32)
@@ -88,7 +89,7 @@ def predict_single_pair(model, image_path, depth_path, img_size=(224, 224)):
 
     # Predict
     pred = model.predict(img_batch, verbose=0)
-    # Output shape is (1, H, W, 7). Model outputs logits/ReLU, apply argmax
+    # Output shape is (1, H, W, TOTAL_CLASSES). Model outputs logits/ReLU, apply argmax
     pred_class = np.argmax(pred[0], axis=-1)  # (H, W)
 
     # Convert class map to RGB
@@ -104,7 +105,7 @@ def predict_single_pair(model, image_path, depth_path, img_size=(224, 224)):
 def compute_iou(y_true_idx, y_pred_idx, n_classes, class_names):
     """Compute per-class IoU and mean IoU."""
     ious = []
-    # Evaluate across the active K=6 classes
+    # Evaluate across the active K=10 kinematic classes
     for c in range(n_classes):
         tp = np.sum((y_true_idx == c) & (y_pred_idx == c))
         fp = np.sum((y_true_idx != c) & (y_pred_idx == c))
@@ -152,7 +153,7 @@ def main():
         # --- Add labels to the middle image (pred_rgb) ---
         labeled_pred_rgb = pred_rgb.copy()
         for class_idx in np.unique(pred_class):
-            if class_idx == 6:  # Skip 'Void'
+            if class_idx == VOID_CLASS:  # Skip 'Void'
                 continue
                 
             class_mask = (pred_class == class_idx).astype(np.uint8)
@@ -192,7 +193,7 @@ def main():
     if args.eval_test:
         print("\nEvaluating on test set...")
         test_gen = RELLIS3DDataset(args.data_root, split="test",
-                              batch_size=args.batch_size if hasattr(args, 'batch_size') else 8,
+                              batch_size=args.batch_size,
                               img_size=img_size)
         X_test, Y_test = test_gen.get_all_data()
 

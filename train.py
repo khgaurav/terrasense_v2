@@ -127,7 +127,7 @@ def parse_args():
 def compute_iou(y_true_idx, y_pred_idx, n_classes, class_names):
     """Compute per-class IoU and mean IoU."""
     ious = []
-    # Ignore the void class (index 6, out of active classes 0-5)
+    # Only the active classes 0..n_classes-1 are scored; void (the last index) is skipped
     for c in range(n_classes):
         tp = np.sum((y_true_idx == c) & (y_pred_idx == c))
         fp = np.sum((y_true_idx != c) & (y_pred_idx == c))

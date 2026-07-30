@@ -8,6 +8,12 @@ Called as:  --input_fn graph_input_fn.calib_input
 
 Loads RGB frames, optionally loads matching depth maps, resizes to 224×224, normalises to [-1, 1].
 Compatible with Python 3.6 (Vitis AI Docker environment).
+
+Calibration must mirror training exactly. Frames stay in OpenCV's native BGR
+order and depth uses the same 10 m range as dataset.py. These constants are
+duplicated rather than imported because this module is executed inside the
+quantizer, where importing the TensorFlow-dependent dataset module is avoidable
+risk — keep them in step with dataset.py.
 """
 
 import os
@@ -25,6 +31,10 @@ IMG_HEIGHT   = 224
 IMG_WIDTH    = 224
 NORM_FACTOR  = 127.5
 BATCH_SIZE   = 10
+
+# Must match dataset.py: DEPTH_CLAMP_M = 10.0 m, stored as millimetres.
+DEPTH_MAX_MM   = 10000.0
+DEPTH_CLAMP_MM = 10000.0
 
 # Collect all image paths once at import time
 _all_paths = sorted(
@@ -58,20 +68,20 @@ def get_depth_path(rgb_path):
 
 
 def load_depth(path):
-    """Loads a 16-bit depth map and normalizes it to [-1, 1]."""
+    """Loads a 16-bit depth map (mm) and normalizes it to [-1, 1] exactly as training does."""
     depth = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if depth is None:
         return np.zeros((IMG_HEIGHT, IMG_WIDTH, 1), dtype=np.float32)
-        
+
     depth = cv2.resize(depth, (IMG_WIDTH, IMG_HEIGHT), interpolation=cv2.INTER_NEAREST)
     depth = depth.astype(np.float32)
-    
-    MAX_DEPTH_VAL = 65535.0
-    if depth.max() > 0:            
-         depth = depth / MAX_DEPTH_VAL * 2.0 - 1.0
-    else:
-         depth = depth * 0.0 - 1.0 # default to background distance
-         
+
+    # Clamp to the reliable range, then map [0, DEPTH_MAX_MM] -> [-1, 1].
+    # Previously divided by 65535, which shrank every calibration depth ~6.5x
+    # relative to training and therefore mis-set the input quantization scale.
+    depth = np.minimum(depth, DEPTH_CLAMP_MM)
+    depth = depth / DEPTH_MAX_MM * 2.0 - 1.0
+
     if len(depth.shape) == 2:
         depth = np.expand_dims(depth, axis=-1)
     return depth

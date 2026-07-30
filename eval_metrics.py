@@ -119,10 +119,13 @@ def evaluate_pb(pb_path, test_gen):
                 
     return np.concatenate(y_true_list, axis=0), np.concatenate(y_pred_list, axis=0)
 
-def compute_metrics(y_true, y_pred, num_classes=6, void_class=6):
+def compute_metrics(y_true, y_pred, num_classes=NUM_CLASSES, void_class=TOTAL_CLASSES - 1):
     """
-    Compute Accuracy, IoU, Precision, Recall, F1-score.
-    Ignores the void class.
+    Compute Accuracy, IoU, Precision, Recall, F1-score over the active kinematic
+    classes (0..num_classes-1), ignoring void.
+
+    Defaults follow the ontology in dataset.py (10 active classes, void = 10);
+    they used to say 6/6, which was left over from the earlier 7-class ontology.
     """
     # Create mask for pixels that are NOT void in the ground truth
     valid_mask = (y_true != void_class)

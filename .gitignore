@@ -1,9 +1,16 @@
 data/
 output/
+output_pt/
+venv/
 __pycache__/
 *.pyc
 *.hdf5
 *.h5
 *.pb
 *.ckpt
+*.pth
 Vitis-AI-Tutorials/
+build_vai/*
+
+# Note: pretrained_weights/*.pth.tar is intentionally tracked (training starts
+# from it) and is not matched by the *.pth rule above.

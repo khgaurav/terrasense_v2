@@ -4,8 +4,11 @@
 RELLIS-3D Dataset Loader for Semantic Segmentation with Early Fusion.
 
 Loads RGB images from rgb/, Depth images from depth/, and color/1D annotations
-from annotations/, converting them to the 7-class kinematic ontology (6 active + Void)
+from annotations/, converting them to the 11-class kinematic ontology (10 active + Void)
 using an Early Fusion (4-channel) architecture with simulated RealSense depth.
+
+CHANNEL ORDER: RGB frames stay in OpenCV's native BGR order (see CHANNEL_ORDER).
+Depth is scaled by normalize_depth() -- inference and DPU calibration must reuse it.
 """
 
 import os
@@ -104,6 +107,12 @@ RELLIS_MAPPING = {
     34: 8    # rubble -> Soft Obstacle
 }
 
+# Raw RELLIS-3D label id used when an annotation is missing or unreadable. These
+# fallbacks are written *before* RELLIS_MAPPING is applied, so the id has to be one
+# that maps to Void: id 0 -> Void. (Using the kinematic Void index here instead
+# would map through to 9/Obstacle and silently poison the labels.)
+RELLIS_VOID_ID = 0
+
 # Precompute mapping array for fast vectorized lookup
 MAPPING_LUT = np.full(256, 10, dtype=np.uint8)
 for k, v in RELLIS_MAPPING.items():
@@ -111,8 +120,34 @@ for k, v in RELLIS_MAPPING.items():
 
 NORM_FACTOR = 127.5
 
+# Channel order the network is trained on (OpenCV native). Declared so inference
+# and DPU calibration cannot drift from training.
+CHANNEL_ORDER = "bgr"
+
+# ─── Depth scaling (single source of truth) ─────────────────────────────────
+# Depth maps are 16-bit millimetres from generate_depth.py. Only the first
+# DEPTH_CLAMP_M metres are treated as reliable (matching the RealSense
+# simulation), and that range is mapped linearly onto [-1, 1]. Inference and
+# quantization calibration must use exactly these numbers.
+DEPTH_CLAMP_M = 10.0
+DEPTH_MAX_MM = DEPTH_CLAMP_M * 1000.0
+
+
+def normalize_depth(depth_mm):
+    """Scale a depth map in millimetres to [-1, 1] the way training does.
+
+    Accepts (H, W) or (H, W, 1) and always returns (H, W, 1) float32.
+    Empty/absent depth maps come out at -1.0, i.e. "no return".
+    """
+    depth = np.asarray(depth_mm, dtype=np.float32)
+    if depth.ndim == 2:
+        depth = np.expand_dims(depth, axis=-1)
+    depth = np.minimum(depth, DEPTH_MAX_MM)
+    return depth / DEPTH_MAX_MM * 2.0 - 1.0
+
+
 def rellis_mask_to_kinematic(mask_1d):
-    """Map a 1D label mask containing RELLIS IDs to the 6 kinematic classes + Void."""
+    """Map a 1D label mask containing RELLIS IDs to the 10 kinematic classes + Void."""
     return MAPPING_LUT[mask_1d]
 
 def class_index_to_rgb(class_map):
@@ -141,8 +176,8 @@ def simulate_realsense_depth(depth_raw, rng):
     # 2. Convert to meters for clamping and noise
     z = dilated.astype(np.float32) / 1000.0
     
-    # 3. Clamp reliable range to 10 meters
-    z_clamped = np.minimum(z, 10.0)
+    # 3. Clamp reliable range (DEPTH_CLAMP_M metres)
+    z_clamped = np.minimum(z, DEPTH_CLAMP_M)
     
     # 4. Add quadratic noise (RealSense stereo noise: sigma = 0.002 * z^2)
     noise_std = 0.002 * (z_clamped ** 2)
@@ -177,8 +212,8 @@ class RELLIS3DDataset(tf.keras.utils.Sequence):
         self.batch_size = batch_size
         self.img_size = img_size  # (H, W)
         self.augment = augment
-        self.n_classes = NUM_CLASSES # 6 active classes
-        self.total_classes = TOTAL_CLASSES # 7 including void
+        self.n_classes = NUM_CLASSES        # 10 active kinematic classes
+        self.total_classes = TOTAL_CLASSES  # 11 including Void
 
         self.rgb_dir = os.path.join(data_root, "rgb")
         self.depth_dir = os.path.join(data_root, "depth")
@@ -281,7 +316,7 @@ class RELLIS3DDataset(tf.keras.utils.Sequence):
                     # Load mask (H, W) as uint8
                     mask = cv2.imread(self.annot_paths[i], cv2.IMREAD_GRAYSCALE)
                     if mask is None:
-                        mask = np.full((self.img_size[0], self.img_size[1]), 6, dtype=np.uint8)
+                        mask = np.full((self.img_size[0], self.img_size[1]), RELLIS_VOID_ID, dtype=np.uint8)
                     else:
                         mask = cv2.resize(mask, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
                     self.cached_annot[i] = mask
@@ -292,12 +327,7 @@ class RELLIS3DDataset(tf.keras.utils.Sequence):
                 # Normalize Depth to [-1, 1] (with simulated RealSense profile)
                 depth_raw = self.cached_depth[i]
                 depth_sim = simulate_realsense_depth(depth_raw, self.rng)
-                depth = depth_sim.astype(np.float32)
-                MAX_DEPTH_VAL = 10000.0
-                if depth.max() > 0:            
-                     depth = depth / MAX_DEPTH_VAL * 2.0 - 1.0
-                else:
-                     depth = depth * 0.0 - 1.0
+                depth = normalize_depth(depth_sim)
                 
                 fused_input = np.concatenate([rgb, depth], axis=-1)
                 mask = self.cached_annot[i]
@@ -307,7 +337,7 @@ class RELLIS3DDataset(tf.keras.utils.Sequence):
                 depth = self._load_depth(self.depth_paths[i])
                 mask_raw = cv2.imread(self.annot_paths[i], cv2.IMREAD_GRAYSCALE)
                 if mask_raw is None:
-                    mask = np.full((self.img_size[0], self.img_size[1]), 6, dtype=np.uint8)
+                    mask = np.full((self.img_size[0], self.img_size[1]), RELLIS_VOID_ID, dtype=np.uint8)
                 else:
                     mask = cv2.resize(mask_raw, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
                 fused_input = np.concatenate([rgb, depth], axis=-1)
@@ -344,19 +374,14 @@ class RELLIS3DDataset(tf.keras.utils.Sequence):
         
         # Apply RealSense simulation on raw image
         img_sim = simulate_realsense_depth(img, self.rng)
-        
-        img_norm = img_sim.astype(np.float32)
-        MAX_DEPTH_VAL = 10000.0
-        if img_norm.max() > 0:
-            return img_norm / MAX_DEPTH_VAL * 2.0 - 1.0
-        else:
-            return img_norm * 0.0 - 1.0
+
+        return normalize_depth(img_sim)
 
     def _load_mask(self, path):
         """Load annotation and map to kinematic classes one-hot."""
         mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if mask is None:
-            mask = np.full((self.img_size[0], self.img_size[1]), 6, dtype=np.uint8)
+            mask = np.full((self.img_size[0], self.img_size[1]), RELLIS_VOID_ID, dtype=np.uint8)
         else:
             mask = cv2.resize(mask, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
         class_map = rellis_mask_to_kinematic(mask)
@@ -390,7 +415,7 @@ class RELLIS3DDataset(tf.keras.utils.Sequence):
 
                     mask = cv2.imread(self.annot_paths[i], cv2.IMREAD_GRAYSCALE)
                     if mask is None:
-                        mask = np.full((self.img_size[0], self.img_size[1]), 6, dtype=np.uint8)
+                        mask = np.full((self.img_size[0], self.img_size[1]), RELLIS_VOID_ID, dtype=np.uint8)
                     else:
                         mask = cv2.resize(mask, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
                     self.cached_annot[i] = mask
@@ -400,12 +425,7 @@ class RELLIS3DDataset(tf.keras.utils.Sequence):
                 # Normalize Depth to [-1, 1] (with simulated RealSense profile)
                 depth_raw = self.cached_depth[i]
                 depth_sim = simulate_realsense_depth(depth_raw, self.rng)
-                depth = depth_sim.astype(np.float32)
-                MAX_DEPTH_VAL = 10000.0
-                if depth.max() > 0:            
-                     depth = depth / MAX_DEPTH_VAL * 2.0 - 1.0
-                else:
-                     depth = depth * 0.0 - 1.0
+                depth = normalize_depth(depth_sim)
                 
                 X[i] = np.concatenate([rgb, depth], axis=-1)
                 class_map = rellis_mask_to_kinematic(self.cached_annot[i])
