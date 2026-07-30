@@ -1,12 +1,10 @@
 #!/bin/bash
-# =============================================================================
 # Freeze the trained RGB-D UNet, quantize it to INT8 and compile it for the KR260
 # DPU. Run from the repository root: bash vitis_ai/run_kr260.sh
 #
 # The freeze step runs on the host because it needs TF2 to load the Keras model;
 # the container only has TF1.15. Point PYTHON at your TF2 interpreter if `python3`
 # is not it.
-# =============================================================================
 set -euo pipefail
 
 PYTHON="${PYTHON:-python3}"
@@ -35,12 +33,12 @@ vai_run() {
         bash -c "source /opt/vitis_ai/conda/bin/activate vitis-ai-tensorflow && $1"
 }
 
-echo "== 1/3 Freeze the Keras model (host, ${PYTHON}) =="
+echo "1/3 Freeze the Keras model (host, ${PYTHON})"
 # Freezing is a graph transformation, so keep it off the GPU entirely.
 CUDA_VISIBLE_DEVICES="" "${PYTHON}" vitis_ai/freeze.py \
     --model "${MODEL_PATH}" --output_dir "${FREEZE_DIR}"
 
-echo "== 2/3 Quantize to INT8 =="
+echo "2/3 Quantize to INT8"
 vai_run "export CALIB_DIR=${DATA_ROOT} && export INPUT_SHAPES=${INPUT_SHAPES} && \
     export PYTHONPATH=\$PYTHONPATH:/workspace && \
     vai_q_tensorflow quantize \
@@ -53,7 +51,7 @@ vai_run "export CALIB_DIR=${DATA_ROOT} && export INPUT_SHAPES=${INPUT_SHAPES} &&
         --input_fn vitis_ai.graph_input_fn.calib_input \
         --calib_iter 10"
 
-echo "== 3/3 Compile for KR260 =="
+echo "3/3 Compile for KR260"
 vai_run "vai_c_tensorflow \
     --frozen_pb ${QUANT_DIR}/quantize_eval_model.pb \
     --arch ${ARCH} \

@@ -21,7 +21,7 @@ import glob
 import numpy as np
 import cv2
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# Configuration
 CALIB_DIR = os.environ.get(
     'CALIB_DIR',
     'data/RELLIS-3D_full'

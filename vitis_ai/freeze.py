@@ -41,7 +41,7 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # ── Load model ─────────────────────────────────────────────────────────
+    # Load model
     print(f"Loading model: {args.model}")
     model = tf.keras.models.load_model(args.model, compile=False)
     print(f"  Input shape:  {model.input_shape}")
@@ -49,7 +49,7 @@ def main():
     n_channels = model.input_shape[-1]   # 3 for RGB
     n_classes  = model.output_shape[-1]  # 25 for RUGD
 
-    # ── Trace to concrete function ─────────────────────────────────────────
+    # Trace to concrete function
     # Use training=False so BN uses inference statistics (frozen mean/var)
     @tf.function(input_signature=[
         tf.TensorSpec(
@@ -65,12 +65,12 @@ def main():
     print(f"\nConcrete function inputs:  {[t.name for t in concrete_fn.inputs]}")
     print(f"Concrete function outputs: {[t.name for t in concrete_fn.outputs]}")
 
-    # ── Freeze (fold variables into constants) ─────────────────────────────
+    # Freeze (fold variables into constants)
     print("\nFreezing graph…")
     frozen_fn     = convert_variables_to_constants_v2(concrete_fn)
     frozen_graph  = frozen_fn.graph.as_graph_def()
 
-    # ── Strip TF2-only artefacts unsupported by TF1.15 / vai_c_tensorflow ──
+    # Strip TF2-only artefacts unsupported by TF1.15 / vai_c_tensorflow
     # 1. TF2 MaxPool carries 'explicit_paddings' which TF1.15 doesn't know.
     # 2. TF2 adds NoOp nodes that vai_c_tensorflow can't handle.
     from tensorflow.core.framework.graph_pb2 import GraphDef
@@ -110,7 +110,7 @@ def main():
     if removed_noop:
         print(f"  Removed {removed_noop} NoOp node(s)")
 
-    # ── Report node names ──────────────────────────────────────────────────
+    # Report node names
     # Input node: the tensor named 'input_1' (strip ':0' suffix)
     input_nodes  = [t.name.split(':')[0] for t in frozen_fn.inputs
                     if not t.name.startswith('unknown')]
@@ -126,13 +126,13 @@ def main():
     print(f"\nInput  node(s) : {input_nodes}")
     print(f"Output node(s) : {output_nodes}")
 
-    # ── Save frozen graph ──────────────────────────────────────────────────
+    # Save frozen graph
     pb_path = os.path.join(args.output_dir, 'frozen_graph.pb')
     tf.io.write_graph(frozen_graph, args.output_dir,
                       'frozen_graph.pb', as_text=False)
     print(f"\nFrozen graph saved → {pb_path}")
 
-    # ── Save node names for the quantise step ──────────────────────────────
+    # Save node names for the quantise step
     names_path = os.path.join(args.output_dir, 'node_names.txt')
     with open(names_path, 'w') as f:
         f.write(f"INPUT_NODE={input_nodes[0] if input_nodes else 'input_1'}\n")
@@ -143,7 +143,7 @@ def main():
         f.write(f"IMG_WIDTH={args.input_width}\n")
     print(f"Node names saved → {names_path}")
 
-    # ── Inspect with vai_q_tensorflow if available ────────────────────────
+    # Inspect with vai_q_tensorflow if available
     print("\nTo inspect with Vitis AI (inside Docker):")
     print(f"  vai_q_tensorflow inspect --input_frozen_graph {pb_path}")
     print("\nAll done.")

@@ -85,17 +85,15 @@ def compute_metrics(y_true, y_pred):
 
 
 def print_report(summary):
-    print("\nPer-class metrics (Void ignored):")
-    print(f"{'Class':<20} | {'IoU':>7} | {'Prec':>7} | {'Recall':>7} | {'F1':>7}")
-    print("-" * 62)
+    print("\nper-class metrics (Void ignored):")
+    print(f"  {'class':<20} {'IoU':>7} {'prec':>7} {'recall':>7} {'F1':>7}")
     for name, m in summary["class_details"].items():
-        print(f"{name:<20} | {m['IoU']:7.4f} | {m['Precision']:7.4f} | "
-              f"{m['Recall']:7.4f} | {m['F1-Score']:7.4f}")
-    print("-" * 62)
-    print(f"{'Mean':<20} | {summary['mean_iou']:7.4f} | {summary['mean_precision']:7.4f} | "
-          f"{summary['mean_recall']:7.4f} | {summary['mean_f1_score']:7.4f}")
-    print(f"\nOverall pixel accuracy: {summary['overall_pixel_accuracy']:.4f}")
-    print(f"Evaluated pixels:       {summary['total_pixels']:,}")
+        print(f"  {name:<20} {m['IoU']:7.4f} {m['Precision']:7.4f} "
+              f"{m['Recall']:7.4f} {m['F1-Score']:7.4f}")
+    print(f"  {'mean':<20} {summary['mean_iou']:7.4f} {summary['mean_precision']:7.4f} "
+          f"{summary['mean_recall']:7.4f} {summary['mean_f1_score']:7.4f}")
+    print(f"\noverall pixel accuracy {summary['overall_pixel_accuracy']:.4f}")
+    print(f"evaluated pixels       {summary['total_pixels']:,}")
 
 
 def save_reports(summary, model_path, json_path, md_path):

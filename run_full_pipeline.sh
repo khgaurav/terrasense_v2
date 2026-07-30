@@ -1,5 +1,4 @@
 #!/bin/bash
-# =============================================================================
 # RELLIS-3D end-to-end pipeline: download → flatten → project depth → train.
 #
 # Re-extracting wipes ${DATASET_DIR}/{rgb,annotations,depth} — which includes the
@@ -9,7 +8,6 @@
 #   DATASET_DIR=...  where the flattened dataset lives (default below)
 #   EPOCHS=...       training epochs (default: 50)
 #   FORCE=1          delete without asking (unattended runs)
-# =============================================================================
 set -euo pipefail
 
 # Resolve the repo root from this script's own location instead of hardcoding it.

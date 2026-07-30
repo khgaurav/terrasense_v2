@@ -111,15 +111,9 @@ def main():
         tf.config.experimental.set_memory_growth(gpu, True)
 
     height, width = IMG_SIZE
-    print("=" * 70)
-    print("RGB-D UNet training on RELLIS-3D (early fusion)")
-    print("=" * 70)
-    print(f"  Epochs:      {args.epochs}")
-    print(f"  Batch size:  {args.batch_size}")
-    print(f"  Optimizer:   {args.optimizer.upper()} (lr={lr})")
-    print(f"  Image size:  {IMG_SIZE}")
-    print(f"  Classes:     {NUM_CLASSES} active (+ Void)")
-    print()
+    print(f"Training RGB-D UNet on RELLIS-3D: {args.epochs} epochs, "
+          f"batch {args.batch_size}, {args.optimizer} lr={lr}")
+    print(f"{width}x{height} early-fusion input, {NUM_CLASSES} active classes (+ Void)")
 
     train_gen = RELLIS3DDataset(args.data_root, split="train", batch_size=args.batch_size,
                                 augment=True, max_samples=args.max_samples)

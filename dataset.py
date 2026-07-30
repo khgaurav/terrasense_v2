@@ -28,7 +28,7 @@ NORM_FACTOR = 127.5
 # Channel order the network is trained on, declared rather than left implicit.
 CHANNEL_ORDER = "bgr"
 
-# ─── Kinematic ontology (11 classes: 10 active + Void) ─────────────────────
+# Kinematic ontology (11 classes: 10 active + Void)
 KINEMATIC_CLASSES = [
     "Smooth Drivable",     # 0 (Asphalt, Concrete)
     "Grass",               # 1
@@ -98,7 +98,7 @@ MAPPING_LUT = np.full(256, 10, dtype=np.uint8)
 for _raw_id, _kinematic in RELLIS_MAPPING.items():
     MAPPING_LUT[_raw_id] = _kinematic
 
-# ─── Depth scaling (single source of truth) ─────────────────────────────────
+# Depth scaling (single source of truth)
 # Depth maps are 16-bit millimetres. Only the first DEPTH_CLAMP_M metres are
 # treated as reliable (matching the RealSense simulation below), and that range is
 # mapped linearly onto [-1, 1].
@@ -186,7 +186,7 @@ class RELLIS3DDataset(tf.keras.utils.Sequence):
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
 
-        print(f"[RELLIS3DDataset] split={split}, samples={len(self.samples)}")
+        print(f"{split} split: {len(self.samples)} samples")
         self._cache = [None] * len(self.samples)
 
     def __len__(self):

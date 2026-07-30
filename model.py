@@ -89,7 +89,7 @@ def build_unet(n_classes, input_height=224, input_width=224,
 
     img_input = Input(shape=(input_height, input_width, 4))
 
-    # ─── Encoder (Downsampling) ──────────────────────────────────────
+    # Encoder (Downsampling)
     # Block 1: n_filters
     c1 = conv2d_block(img_input, n_filters * 1, batchnorm=batchnorm)
     p1 = MaxPooling2D((2, 2))(c1)
@@ -114,7 +114,7 @@ def build_unet(n_classes, input_height=224, input_width=224,
     c5 = conv2d_block(p4, n_filters * 16, batchnorm=batchnorm)
     p5 = Dropout(dropout)(c5)
 
-    # ─── Decoder (Upsampling) ────────────────────────────────────────
+    # Decoder (Upsampling)
     # Block 6
     up6 = UpSampling2D(size=(2, 2), data_format=IMAGE_ORDERING,
                        interpolation="bilinear")(p5)
@@ -155,7 +155,7 @@ def build_unet(n_classes, input_height=224, input_width=224,
     m9 = Dropout(dropout)(m9)
     c9 = conv2d_block(m9, n_filters * 1, batchnorm=batchnorm)
 
-    # ─── Output ──────────────────────────────────────────────────────
+    # Output
     # Use relu activation (no softmax) for Vitis AI DPU compatibility.
     # Softmax is computed in software by the ARM CPU.
     c10 = Conv2D(
