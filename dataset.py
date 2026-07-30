@@ -1,38 +1,50 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-RELLIS-3D Dataset Loader for Semantic Segmentation with Early Fusion.
+RELLIS-3D dataset for the early-fusion RGB-D UNet.
 
-Loads RGB images from rgb/, Depth images from depth/, and color/1D annotations
-from annotations/, converting them to the 11-class kinematic ontology (10 active + Void)
-using an Early Fusion (4-channel) architecture with simulated RealSense depth.
+Reads RGB from rgb/, projected LiDAR depth from depth/ (see generate_depth.py) and
+label ids from annotations/, remaps the RELLIS-3D ontology to 11 kinematic classes
+(10 active + Void) and yields 4-channel RGB-D inputs.
 
-CHANNEL ORDER: RGB frames stay in OpenCV's native BGR order (see CHANNEL_ORDER).
-Depth is scaled by normalize_depth() -- inference and DPU calibration must reuse it.
+CHANNEL ORDER: RGB frames stay in OpenCV's native BGR order and are scaled to
+[-1, 1]; depth is scaled by normalize_depth(). Inference and DPU calibration must
+reuse both. Decoded frames are cached in RAM on first access.
 """
 
 import os
+
 import cv2
 import numpy as np
 import tensorflow as tf
 
-# ─── Kinematic Ontology (K=11: 10 active + Void) ───────────────────────────
+# Input resolution of the whole pipeline: training, calibration and the compiled
+# xmodel all use this shape.
+IMG_SIZE = (224, 224)  # (H, W)
+
+# Scale factor mapping uint8 pixels to [-1, 1].
+NORM_FACTOR = 127.5
+
+# Channel order the network is trained on, declared rather than left implicit.
+CHANNEL_ORDER = "bgr"
+
+# ─── Kinematic ontology (11 classes: 10 active + Void) ─────────────────────
 KINEMATIC_CLASSES = [
     "Smooth Drivable",     # 0 (Asphalt, Concrete)
-    "Grass",               # 1 (Grass)
-    "Dirt",                # 2 (Dirt)
-    "Sand",                # 3 (Sand)
-    "Gravel",              # 4 (Gravel)
-    "Mulch",               # 5 (Mulch)
-    "Puddle",              # 6 (Puddle)
-    "Mud",                 # 7 (Mud)
-    "Soft Obstacle",       # 8 (Bush, Log, Rubble — potentially traversable for larger robots)
-    "Obstacle",            # 9 (Tree, Water, Vehicle, Barrier, Building, Person, Fence, Pole, etc.)
+    "Grass",               # 1
+    "Dirt",                # 2
+    "Sand",                # 3
+    "Gravel",              # 4
+    "Mulch",               # 5
+    "Puddle",              # 6
+    "Mud",                 # 7
+    "Soft Obstacle",       # 8 (Bush, Log, Rubble — passable for larger robots)
+    "Obstacle",            # 9 (Tree, Water, Vehicle, Barrier, Building, Person, ...)
     "Void"                 # 10 (Sky, Unlabeled)
 ]
 
-NUM_CLASSES = 10 # The active K=10 kinematic classes models predict on (0-9)
-TOTAL_CLASSES = 11 # Including Void
+NUM_CLASSES = 10    # active classes the model is scored on (0-9)
+TOTAL_CLASSES = 11  # including Void, which the model still predicts
 
 KINEMATIC_COLORMAP = np.array([
     [128, 128, 128],  # 0: Smooth Drivable (Gray)
@@ -48,33 +60,7 @@ KINEMATIC_COLORMAP = np.array([
     [  0,   0,   0]   # 10: Void (Black)
 ], dtype=np.uint8)
 
-# Traversability costs for a 4-wheeled robot (scale: 0-255)
-# 0: Smooth Drivable (Asphalt, Concrete) -> Lowest resistance (Cost: 1)
-# 1: Grass                                -> Low-medium friction (Cost: 10)
-# 2: Dirt                                 -> Good unpaved traction (Cost: 5)
-# 3: Sand                                 -> Very high slip, sinkage risk (Cost: 30)
-# 4: Gravel                               -> Hard loose surface, some slip (Cost: 15)
-# 5: Mulch                                -> Spongy organic cover, low traction (Cost: 25)
-# 6: Puddle                               -> Water pocket, unknown bottom (Cost: 40)
-# 7: Mud                                  -> High slip, sinkage, trapping risk (Cost: 90)
-# 8: Soft Obstacle (Bush, Log, Rubble)    -> Passable with risk (Cost: 80)
-# 9: Obstacle (Tree, Water, Vehicle, etc.)-> Lethal / collision (Cost: 255)
-# 10: Void (Sky, Unknown)                 -> Ignore / lethal (Cost: 255)
-CLASS_COSTS = {
-    0: 1,
-    1: 10,
-    2: 5,
-    3: 30,
-    4: 15,
-    5: 25,
-    6: 40,
-    7: 90,
-    8: 80,
-    9: 255,
-    10: 255
-}
-
-# Map original RELLIS-3D IDs (0-34) to Kinematic classes (0-10)
+# Original RELLIS-3D label ids (0-34) -> kinematic classes (0-10)
 RELLIS_MAPPING = {
     0: 10,   # void -> Void
     1: 2,    # dirt -> Dirt
@@ -107,28 +93,15 @@ RELLIS_MAPPING = {
     34: 8    # rubble -> Soft Obstacle
 }
 
-# Raw RELLIS-3D label id used when an annotation is missing or unreadable. These
-# fallbacks are written *before* RELLIS_MAPPING is applied, so the id has to be one
-# that maps to Void: id 0 -> Void. (Using the kinematic Void index here instead
-# would map through to 9/Obstacle and silently poison the labels.)
-RELLIS_VOID_ID = 0
-
-# Precompute mapping array for fast vectorized lookup
+# Unmapped ids fall through to Void.
 MAPPING_LUT = np.full(256, 10, dtype=np.uint8)
-for k, v in RELLIS_MAPPING.items():
-    MAPPING_LUT[k] = v
-
-NORM_FACTOR = 127.5
-
-# Channel order the network is trained on (OpenCV native). Declared so inference
-# and DPU calibration cannot drift from training.
-CHANNEL_ORDER = "bgr"
+for _raw_id, _kinematic in RELLIS_MAPPING.items():
+    MAPPING_LUT[_raw_id] = _kinematic
 
 # ─── Depth scaling (single source of truth) ─────────────────────────────────
-# Depth maps are 16-bit millimetres from generate_depth.py. Only the first
-# DEPTH_CLAMP_M metres are treated as reliable (matching the RealSense
-# simulation), and that range is mapped linearly onto [-1, 1]. Inference and
-# quantization calibration must use exactly these numbers.
+# Depth maps are 16-bit millimetres. Only the first DEPTH_CLAMP_M metres are
+# treated as reliable (matching the RealSense simulation below), and that range is
+# mapped linearly onto [-1, 1].
 DEPTH_CLAMP_M = 10.0
 DEPTH_MAX_MM = DEPTH_CLAMP_M * 1000.0
 
@@ -137,314 +110,141 @@ def normalize_depth(depth_mm):
     """Scale a depth map in millimetres to [-1, 1] the way training does.
 
     Accepts (H, W) or (H, W, 1) and always returns (H, W, 1) float32.
-    Empty/absent depth maps come out at -1.0, i.e. "no return".
+    Absent depth (all zeros) comes out at -1.0, i.e. "no return".
     """
     depth = np.asarray(depth_mm, dtype=np.float32)
     if depth.ndim == 2:
         depth = np.expand_dims(depth, axis=-1)
-    depth = np.minimum(depth, DEPTH_MAX_MM)
-    return depth / DEPTH_MAX_MM * 2.0 - 1.0
+    return np.minimum(depth, DEPTH_MAX_MM) / DEPTH_MAX_MM * 2.0 - 1.0
 
 
-def rellis_mask_to_kinematic(mask_1d):
-    """Map a 1D label mask containing RELLIS IDs to the 10 kinematic classes + Void."""
-    return MAPPING_LUT[mask_1d]
+def rellis_mask_to_kinematic(mask_ids):
+    """Map raw RELLIS-3D label ids to the 10 kinematic classes + Void."""
+    return MAPPING_LUT[mask_ids]
+
 
 def class_index_to_rgb(class_map):
-    """Convert a class index map (H, W) back to an RGB image (H, W, 3)."""
-    h, w = class_map.shape
-    rgb = np.zeros((h, w, 3), dtype=np.uint8)
-    for c in range(TOTAL_CLASSES):
-        mask = class_map == c
-        rgb[mask] = KINEMATIC_COLORMAP[c]
-    return rgb
+    """Colour a class index map (H, W) for visualisation."""
+    return KINEMATIC_COLORMAP[class_map]
 
-def simulate_realsense_depth(depth_raw, rng):
+
+def simulate_realsense_depth(depth_mm, rng):
+    """Make projected LiDAR depth look like an Intel RealSense stereo sensor.
+
+    Dilate to fill the gaps between laser rings, clamp to the reliable range, then
+    add the distance-dependent noise of a stereo sensor (sigma = 0.002 * z^2).
+    Training on degraded depth is what lets the model transfer to the cheaper
+    sensor the robot actually carries.
     """
-    Simulate Intel RealSense depth map from raw LiDAR projected depth map (H, W, 1).
-    
-    Steps:
-    1. Densification: Morphological dilation to fill sparse laser rings.
-    2. Range Clamping: Clamp depth values to a reliable 10-meter range.
-    3. Quadratic Noise: Add distance-dependent noise: sigma = 0.002 * depth_meters^2.
-    """
-    # 1. Morphological dilation to fill sparse laser rings (H, W)
-    depth_2d = depth_raw[:, :, 0]
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    dilated = cv2.dilate(depth_2d, kernel)
-    
-    # 2. Convert to meters for clamping and noise
-    z = dilated.astype(np.float32) / 1000.0
-    
-    # 3. Clamp reliable range (DEPTH_CLAMP_M metres)
-    z_clamped = np.minimum(z, DEPTH_CLAMP_M)
-    
-    # 4. Add quadratic noise (RealSense stereo noise: sigma = 0.002 * z^2)
-    noise_std = 0.002 * (z_clamped ** 2)
+    dilated = cv2.dilate(depth_mm[:, :, 0],
+                         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+
+    z = np.minimum(dilated.astype(np.float32) / 1000.0, DEPTH_CLAMP_M)
+    noise_std = 0.002 * (z ** 2)
     try:
-        noise = rng.standard_normal(z_clamped.shape, dtype=np.float32) * noise_std
-    except TypeError:
-        noise = (rng.standard_normal(z_clamped.shape) * noise_std).astype(np.float32)
-    z_noisy = z_clamped + noise
-    
-    # 5. Convert back to uint16 mm and restore channel dimension
-    simulated_depth = np.clip(z_noisy * 1000.0, 0, 65535).astype(np.uint16)
-    return np.expand_dims(simulated_depth, axis=-1)
+        noise = rng.standard_normal(z.shape, dtype=np.float32) * noise_std
+    except TypeError:                       # older numpy has no dtype argument
+        noise = (rng.standard_normal(z.shape) * noise_std).astype(np.float32)
 
-# ─── Keras Sequence Data Generator ──────────────────────────────────────────
+    noisy_mm = np.clip((z + noise) * 1000.0, 0, 65535).astype(np.uint16)
+    return np.expand_dims(noisy_mm, axis=-1)
+
 
 class RELLIS3DDataset(tf.keras.utils.Sequence):
-    """
-    Keras Sequence generator for RELLIS-3D with early fusion (RGB + Depth).
+    """Keras Sequence over one RELLIS-3D split.
 
-    Args:
-        data_root:  Standard structure containing rgb/, depth/, and annotations/
-        split:      'train', 'val', or 'test'
-        batch_size: Batch size
-        img_size:   (height, width) tuple
-        augment:    Whether to apply data augmentation (horizontal flip)
-        max_samples: Maximum number of samples to load (useful for testing)
+    Yields (4-channel RGB-D in [-1, 1], one-hot masks over TOTAL_CLASSES).
     """
 
-    def __init__(self, data_root, split="train", batch_size=8,
-                 img_size=(224, 224), augment=False, max_samples=None):
-        self.data_root = data_root
+    def __init__(self, data_root, split="train", batch_size=8, augment=False,
+                 max_samples=None):
         self.batch_size = batch_size
-        self.img_size = img_size  # (H, W)
         self.augment = augment
-        self.n_classes = NUM_CLASSES        # 10 active kinematic classes
-        self.total_classes = TOTAL_CLASSES  # 11 including Void
+        self.rng = np.random.default_rng(42)
 
-        self.rgb_dir = os.path.join(data_root, "rgb")
-        self.depth_dir = os.path.join(data_root, "depth")
-        self.annot_dir = os.path.join(data_root, "annotations")
+        rgb_dir = os.path.join(data_root, "rgb")
+        depth_dir = os.path.join(data_root, "depth")
+        annot_dir = os.path.join(data_root, "annotations")
+        lst_file = os.path.join(data_root, "Rellis_3D_image_split", f"{split}.lst")
 
-        self.rgb_paths = []
-        self.depth_paths = []
-        self.annot_paths = []
-
-        if not os.path.exists(self.rgb_dir):
-            print(f"WARNING: RELLIS-3D rgb dir not found: {self.rgb_dir}")
-            return
-            
-        # Locate the split list file
-        split_dir = os.path.join(data_root, "Rellis_3D_image_split")
-        lst_file = os.path.join(split_dir, f"{split}.lst")
-        
+        self.samples = []  # (rgb_path, depth_path, annotation_path)
         if not os.path.exists(lst_file):
-            print(f"WARNING: RELLIS-3D split list file not found: {lst_file}")
-            return
-
-        # Parse and match files listed in the split list
-        with open(lst_file, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                
-                rgb_base = os.path.basename(parts[0])
-                label_base = os.path.basename(parts[1])
-                
-                rgb_path = os.path.join(self.rgb_dir, rgb_base)
-                annot_path = os.path.join(self.annot_dir, label_base)
-                
-                base_name = os.path.splitext(rgb_base)[0]
-                depth_path = os.path.join(self.depth_dir, base_name + ".png")
-                if not os.path.exists(depth_path):
-                    depth_path = os.path.join(self.depth_dir, base_name + ".jpg")
-                
-                # Check that all three modalities exist (RGB, projected depth, and label)
-                if os.path.exists(rgb_path) and os.path.exists(depth_path) and os.path.exists(annot_path):
-                    self.rgb_paths.append(rgb_path)
-                    self.depth_paths.append(depth_path)
-                    self.annot_paths.append(annot_path)
+            print(f"WARNING: split list not found: {lst_file}")
+        else:
+            with open(lst_file) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    rgb = os.path.join(rgb_dir, os.path.basename(parts[0]))
+                    annot = os.path.join(annot_dir, os.path.basename(parts[1]))
+                    stem = os.path.splitext(os.path.basename(parts[0]))[0]
+                    depth = os.path.join(depth_dir, stem + ".png")
+                    if all(os.path.exists(p) for p in (rgb, depth, annot)):
+                        self.samples.append((rgb, depth, annot))
 
         if max_samples is not None:
-            self.rgb_paths = self.rgb_paths[:max_samples]
-            self.depth_paths = self.depth_paths[:max_samples]
-            self.annot_paths = self.annot_paths[:max_samples]
+            self.samples = self.samples[:max_samples]
 
-        print(f"[RELLIS3DDataset] split={split}, explicitly matching items={len(self.rgb_paths)}")
-
-        # RAM Caching to bypass slow on-the-fly OpenCV file loading/decoding
-        # Uses lazy initialization to prevent massive startup delays
-        self.cache = True
-        self.cached_rgb = [None] * len(self.rgb_paths)
-        self.cached_depth = [None] * len(self.rgb_paths)
-        self.cached_annot = [None] * len(self.rgb_paths)
-        
-        # Instantiate RNG for RealSense simulation noise
-        try:
-            self.rng = np.random.default_rng(42)
-        except AttributeError:
-            self.rng = np.random.RandomState(42)
+        print(f"[RELLIS3DDataset] split={split}, samples={len(self.samples)}")
+        self._cache = [None] * len(self.samples)
 
     def __len__(self):
-        return int(np.ceil(len(self.rgb_paths) / self.batch_size))
+        return int(np.ceil(len(self.samples) / self.batch_size))
+
+    def _load(self, i):
+        """Decode and resize one sample; the raw arrays are cached."""
+        rgb_path, depth_path, annot_path = self.samples[i]
+        h, w = IMG_SIZE
+
+        rgb = cv2.imread(rgb_path, cv2.IMREAD_COLOR)            # BGR
+        if rgb is None:
+            raise FileNotFoundError(f"Unreadable image: {rgb_path}")
+        rgb = cv2.resize(rgb, (w, h))
+
+        depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)    # uint16 mm
+        if depth is None:
+            raise FileNotFoundError(f"Unreadable depth map: {depth_path}")
+        depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+        if depth.ndim == 2:
+            depth = np.expand_dims(depth, axis=-1)
+
+        mask = cv2.imread(annot_path, cv2.IMREAD_GRAYSCALE)     # raw RELLIS ids
+        if mask is None:
+            raise FileNotFoundError(f"Unreadable annotation: {annot_path}")
+        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        return rgb, depth, rellis_mask_to_kinematic(mask)
 
     def __getitem__(self, idx):
         start = idx * self.batch_size
-        end = min(start + self.batch_size, len(self.rgb_paths))
+        end = min(start + self.batch_size, len(self.samples))
+        h, w = IMG_SIZE
 
-        X_batch = np.zeros((end - start, self.img_size[0], self.img_size[1], 4), dtype=np.float32)
-        Y_batch = np.zeros((end - start, self.img_size[0], self.img_size[1], self.total_classes), dtype=np.float32)
+        X = np.zeros((end - start, h, w, 4), dtype=np.float32)
+        Y = np.zeros((end - start, h, w, TOTAL_CLASSES), dtype=np.float32)
+        eye = np.eye(TOTAL_CLASSES, dtype=np.float32)
 
-        for i_batch, i in enumerate(range(start, end)):
-            if self.cache:
-                if self.cached_rgb[i] is None:
-                    # Load raw RGB (H, W, 3) as uint8
-                    rgb = cv2.imread(self.rgb_paths[i], cv2.IMREAD_COLOR)
-                    if rgb is None:
-                        rgb = np.zeros((self.img_size[0], self.img_size[1], 3), dtype=np.uint8)
-                    else:
-                        rgb = cv2.resize(rgb, (self.img_size[1], self.img_size[0]))
-                    self.cached_rgb[i] = rgb
+        for n, i in enumerate(range(start, end)):
+            if self._cache[i] is None:
+                self._cache[i] = self._load(i)
+            rgb, depth, class_map = self._cache[i]
 
-                    # Load depth (H, W, 1) as uint16
-                    depth = cv2.imread(self.depth_paths[i], cv2.IMREAD_UNCHANGED)
-                    if depth is None:
-                        depth = np.zeros((self.img_size[0], self.img_size[1], 1), dtype=np.uint16)
-                    else:
-                        depth = cv2.resize(depth, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
-                        if len(depth.shape) == 2:
-                            depth = np.expand_dims(depth, axis=-1)
-                    self.cached_depth[i] = depth
-
-                    # Load mask (H, W) as uint8
-                    mask = cv2.imread(self.annot_paths[i], cv2.IMREAD_GRAYSCALE)
-                    if mask is None:
-                        mask = np.full((self.img_size[0], self.img_size[1]), RELLIS_VOID_ID, dtype=np.uint8)
-                    else:
-                        mask = cv2.resize(mask, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
-                    self.cached_annot[i] = mask
-
-                # Normalize RGB to [-1, 1]
-                rgb = self.cached_rgb[i].astype(np.float32) / NORM_FACTOR - 1.0
-                
-                # Normalize Depth to [-1, 1] (with simulated RealSense profile)
-                depth_raw = self.cached_depth[i]
-                depth_sim = simulate_realsense_depth(depth_raw, self.rng)
-                depth = normalize_depth(depth_sim)
-                
-                fused_input = np.concatenate([rgb, depth], axis=-1)
-                mask = self.cached_annot[i]
-                class_map = rellis_mask_to_kinematic(mask)
-            else:
-                rgb = self._load_rgb(self.rgb_paths[i])
-                depth = self._load_depth(self.depth_paths[i])
-                mask_raw = cv2.imread(self.annot_paths[i], cv2.IMREAD_GRAYSCALE)
-                if mask_raw is None:
-                    mask = np.full((self.img_size[0], self.img_size[1]), RELLIS_VOID_ID, dtype=np.uint8)
-                else:
-                    mask = cv2.resize(mask_raw, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
-                fused_input = np.concatenate([rgb, depth], axis=-1)
-                class_map = rellis_mask_to_kinematic(mask)
-
-            # Fast vectorized one-hot encoding using broadcasting
-            mask_categorical = (class_map[..., None] == np.arange(self.total_classes)).astype(np.float32)
+            fused = np.concatenate([
+                rgb.astype(np.float32) / NORM_FACTOR - 1.0,
+                normalize_depth(simulate_realsense_depth(depth, self.rng)),
+            ], axis=-1)
+            onehot = eye[class_map]
 
             if self.augment and np.random.rand() > 0.5:
-                fused_input = np.fliplr(fused_input)
-                mask_categorical = np.fliplr(mask_categorical)
+                fused, onehot = np.fliplr(fused), np.fliplr(onehot)
 
-            X_batch[i_batch] = fused_input
-            Y_batch[i_batch] = mask_categorical
-
-        return X_batch, Y_batch
-
-    def _load_rgb(self, path):
-        """Load and normalize RGB image to [-1, 1]."""
-        img = cv2.imread(path, cv2.IMREAD_COLOR)  # BGR
-        if img is None:
-            return np.zeros((self.img_size[0], self.img_size[1], 3), dtype=np.float32)
-        img = cv2.resize(img, (self.img_size[1], self.img_size[0]))
-        return img.astype(np.float32) / NORM_FACTOR - 1.0
-
-    def _load_depth(self, path):
-        """Load, simulate RealSense depth, and normalize to [-1, 1]."""
-        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            return np.zeros((self.img_size[0], self.img_size[1], 1), dtype=np.float32)
-        img = cv2.resize(img, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
-        if len(img.shape) == 2:
-            img = np.expand_dims(img, axis=-1)
-        
-        # Apply RealSense simulation on raw image
-        img_sim = simulate_realsense_depth(img, self.rng)
-
-        return normalize_depth(img_sim)
-
-    def _load_mask(self, path):
-        """Load annotation and map to kinematic classes one-hot."""
-        mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            mask = np.full((self.img_size[0], self.img_size[1]), RELLIS_VOID_ID, dtype=np.uint8)
-        else:
-            mask = cv2.resize(mask, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
-        class_map = rellis_mask_to_kinematic(mask)
-        one_hot = (class_map[..., None] == np.arange(self.total_classes)).astype(np.float32)
-        return one_hot
-
-    def get_all_data(self, max_images=None):
-        """Load all images into numpy arrays."""
-        n = len(self.rgb_paths) if max_images is None else min(max_images, len(self.rgb_paths))
-        X = np.zeros((n, self.img_size[0], self.img_size[1], 4), dtype=np.float32)
-        Y = np.zeros((n, self.img_size[0], self.img_size[1], self.total_classes), dtype=np.float32)
-        for i in range(n):
-            if self.cache:
-                if self.cached_rgb[i] is None:
-                    # Populate cache element
-                    rgb = cv2.imread(self.rgb_paths[i], cv2.IMREAD_COLOR)
-                    if rgb is None:
-                        rgb = np.zeros((self.img_size[0], self.img_size[1], 3), dtype=np.uint8)
-                    else:
-                        rgb = cv2.resize(rgb, (self.img_size[1], self.img_size[0]))
-                    self.cached_rgb[i] = rgb
-
-                    depth = cv2.imread(self.depth_paths[i], cv2.IMREAD_UNCHANGED)
-                    if depth is None:
-                        depth = np.zeros((self.img_size[0], self.img_size[1], 1), dtype=np.uint16)
-                    else:
-                        depth = cv2.resize(depth, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
-                        if len(depth.shape) == 2:
-                            depth = np.expand_dims(depth, axis=-1)
-                    self.cached_depth[i] = depth
-
-                    mask = cv2.imread(self.annot_paths[i], cv2.IMREAD_GRAYSCALE)
-                    if mask is None:
-                        mask = np.full((self.img_size[0], self.img_size[1]), RELLIS_VOID_ID, dtype=np.uint8)
-                    else:
-                        mask = cv2.resize(mask, (self.img_size[1], self.img_size[0]), interpolation=cv2.INTER_NEAREST)
-                    self.cached_annot[i] = mask
-
-                # Get from cache
-                rgb = self.cached_rgb[i].astype(np.float32) / NORM_FACTOR - 1.0
-                # Normalize Depth to [-1, 1] (with simulated RealSense profile)
-                depth_raw = self.cached_depth[i]
-                depth_sim = simulate_realsense_depth(depth_raw, self.rng)
-                depth = normalize_depth(depth_sim)
-                
-                X[i] = np.concatenate([rgb, depth], axis=-1)
-                class_map = rellis_mask_to_kinematic(self.cached_annot[i])
-                Y[i] = (class_map[..., None] == np.arange(self.total_classes)).astype(np.float32)
-            else:
-                rgb = self._load_rgb(self.rgb_paths[i])
-                depth = self._load_depth(self.depth_paths[i])
-                X[i] = np.concatenate([rgb, depth], axis=-1)
-                Y[i] = self._load_mask(self.annot_paths[i])
+            X[n] = fused
+            Y[n] = onehot
         return X, Y
 
     def on_epoch_end(self):
-        """Shuffle data at end of each epoch."""
-        indices = np.arange(len(self.rgb_paths))
-        np.random.shuffle(indices)
-        self.rgb_paths = [self.rgb_paths[i] for i in indices]
-        self.depth_paths = [self.depth_paths[i] for i in indices]
-        self.annot_paths = [self.annot_paths[i] for i in indices]
-        if self.cache:
-            self.cached_rgb = [self.cached_rgb[i] for i in indices]
-            self.cached_depth = [self.cached_depth[i] for i in indices]
-            self.cached_annot = [self.cached_annot[i] for i in indices]
+        """Shuffle sample order (and the cache alongside it) between epochs."""
+        order = np.random.permutation(len(self.samples))
+        self.samples = [self.samples[i] for i in order]
+        self._cache = [self._cache[i] for i in order]
